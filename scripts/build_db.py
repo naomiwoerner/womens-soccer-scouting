@@ -21,6 +21,7 @@ from src.validation import run_validation  # noqa: E402
 
 DB_PATH = PROJECT_ROOT / "data" / "scouting.db"
 MIN_SEASON_MINUTES = 600
+LOCATION_METRIC_EVENT_TYPES = ("Pass", "Carry")
 
 
 def player_match_columns_sql() -> str:
@@ -112,6 +113,12 @@ CREATE TABLE metric_definitions (
     higher_is_better INTEGER NOT NULL
 );
 
+CREATE TABLE data_quality (
+    check_name TEXT PRIMARY KEY,
+    count      INTEGER NOT NULL,
+    treatment  TEXT NOT NULL
+);
+
 CREATE VIEW player_season_p90 AS
 SELECT
     p.player_id,
@@ -194,6 +201,38 @@ def build_metric_definitions() -> pd.DataFrame:
     )
 
 
+def build_data_quality() -> pd.DataFrame:
+    """Return the data-quality checks that need the raw events.
+
+    data/raw is not in the repository, so the app reads these results from the
+    database. Passes and carries are always listed, even at zero, because the
+    progressive and final-third metrics depend on their coordinates.
+    """
+    events = pd.read_parquet(EVENTS_PATH, columns=["type", "location"])
+    missing = events.loc[events["location"].isna(), "type"].value_counts().to_dict()
+    for event_type in LOCATION_METRIC_EVENT_TYPES:
+        missing.setdefault(event_type, 0)
+
+    rows = []
+    for event_type, count in sorted(missing.items()):
+        if event_type in LOCATION_METRIC_EVENT_TYPES:
+            treatment = (
+                "Used by the progressive and final-third metrics, which need both coordinates."
+                if count == 0
+                else "Used by location metrics: these events break the coordinate calculations."
+            )
+        else:
+            treatment = "Event has no on-pitch position. No metric reads its location, so no action."
+        rows.append(
+            {
+                "check_name": f"Events missing location: {event_type}",
+                "count": int(count),
+                "treatment": treatment,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def write_database(tables: dict[str, pd.DataFrame]) -> None:
     """Replace the database file with one containing the given tables."""
     DB_PATH.unlink(missing_ok=True)
@@ -222,6 +261,7 @@ def main() -> None:
             "matches": build_matches(matches, minutes),
             "player_match": build_player_match(minutes, events),
             "metric_definitions": build_metric_definitions(),
+            "data_quality": build_data_quality(),
         }
     )
 
@@ -234,6 +274,7 @@ def main() -> None:
             "matches",
             "player_match",
             "metric_definitions",
+            "data_quality",
             "player_season_p90",
             "player_percentiles",
         ):

@@ -120,6 +120,10 @@ def print_view_checks(connection: sqlite3.Connection) -> bool:
             "SELECT (SELECT COUNT(*) FROM player_season_p90)"
             " - (SELECT COUNT(*) FROM player_percentiles)"
         ),
+        "Passes and carries with no location": (
+            "SELECT SUM(count) FROM data_quality WHERE check_name IN "
+            "('Events missing location: Pass', 'Events missing location: Carry')"
+        ),
     }
     print("\nStructural checks (each should be 0)")
     all_pass = True
