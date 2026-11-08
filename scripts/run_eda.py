@@ -19,6 +19,7 @@ from src.metrics import METRICS  # noqa: E402
 
 DB_PATH = PROJECT_ROOT / "data" / "scouting.db"
 SLIDER_EXAMPLES = (300, 600, 900, 1200)
+DESCRIPTIVE_EXAMPLES = ("npxg", "progressive_passes")
 
 
 def stability_pivot(stability: pd.DataFrame) -> pd.DataFrame:
@@ -86,6 +87,20 @@ def main() -> None:
             ignore_index=True,
         )
         print_section("Reliability at minutes", by_minutes.round(3))
+
+        descriptive = eda.descriptive_stats(connection)
+        for metric in DESCRIPTIVE_EXAMPLES:
+            print_section(f"Descriptive stats: {metric}", descriptive[descriptive["metric"] == metric].round(3))
+        _, outlier_summary = eda.outlier_table(connection)
+        print_section("Outlier summary", outlier_summary.round(3))
+        print_section("Top correlated pairs: pooled", eda.top_correlated_pairs(connection, "pooled").round(3))
+        print_section(
+            "Top correlated pairs: averaged within group",
+            eda.top_correlated_pairs(connection, "within_group").round(3),
+        )
+        print_section("Team season table", eda.team_season_table(connection).round(2))
+        print_section("Team table checks", eda.team_season_checks(connection))
+        print_section("Team-level correlations", eda.team_level_correlations(connection).round(3))
         if arguments.figures_dir:
             save_figures(connection, arguments.figures_dir)
             print(f"\nSaved figures to {arguments.figures_dir}")

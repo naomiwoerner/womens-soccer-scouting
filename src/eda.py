@@ -8,6 +8,7 @@ database alone.
 import re
 import sqlite3
 from dataclasses import dataclass
+from itertools import combinations
 
 import numpy as np
 import pandas as pd
@@ -21,6 +22,14 @@ STABILITY_DRAWS = 200
 STABILITY_SEED = 42
 POOL_HALF_MINUTES = 600
 RATE_DECIMALS = 9
+DEFAULT_MIN_MINUTES = 600
+OUTLIER_IQR_MULTIPLE = 1.5
+OUTLIER_MINUTES_BAND = 900
+SEASON_MATCHES = 22
+PLAUSIBLE_ORDER_R = 0.80
+TOTALS_TOLERANCE = 1e-6
+SCOPE_COLUMNS = {"pooled": "pooled_r", "within_group": "within_group_r"}
+CORRELATION_METRICS = [metric for metric in METRICS if metric.name != "xg"]
 HIGH_RELIABILITY = 0.70
 MODERATE_RELIABILITY = 0.55
 RELIABILITY_NOTES = {
@@ -48,6 +57,9 @@ TEXT_SECONDARY = "#52514e"
 GRID = "#e4e3df"
 CONTEXT_LINE = "#c3c2b7"
 BAND_FILL = "rgba(42, 120, 214, 0.22)"
+DIVERGING_NEGATIVE = "#e34948"
+DIVERGING_MIDPOINT = "#f0efec"
+DIVERGING_POSITIVE = "#2a78d6"
 SERIES_COLORS = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4")
 
 
@@ -214,6 +226,7 @@ def data_quality_summary(conn: sqlite3.Connection) -> pd.DataFrame:
         *_completion_check_rows(conn),
         _transfer_check_row(conn),
         *_exclusion_check_rows(conn),
+        _outlier_check_row(conn),
     ]
     return pd.concat([stored, pd.DataFrame(computed)], ignore_index=True)
 
@@ -532,6 +545,11 @@ def median_minutes_per_half(
     capped sample really contains, pooled over all players and draws.
     """
     _, actual = _stability_draws(conn, thresholds, n_draws, seed)
+    return _median_minutes_table(actual, thresholds)
+
+
+def _median_minutes_table(actual: np.ndarray, thresholds: tuple[int, ...]) -> pd.DataFrame:
+    """Return median actual minutes per half from the array of sampled minutes."""
     rows = []
     for position, threshold in enumerate(thresholds):
         minutes = actual[:, position]
@@ -581,10 +599,16 @@ def reliability_at_minutes(conn: sqlite3.Connection, minutes: float) -> pd.DataF
 
     The app's minutes slider needs a value between the computed thresholds. This
     interpolates linearly between them and holds the end values outside their
-    range. Returns one row with minutes and mean_r_full.
+    range. The x-values are actual sampled minutes (2 x the median actual minutes
+    per half), not the nominal thresholds, because whole matches overshoot each
+    target and nominal labels would make the slider value optimistic. Returns one
+    row with minutes and mean_r_full.
     """
-    means = stability_mean_range(conn)
-    mean_r_full = float(np.interp(minutes, means["threshold"], means["mean_r_full"]))
+    thresholds = STABILITY_THRESHOLDS
+    draws, actual = _stability_draws(conn, thresholds, STABILITY_DRAWS, STABILITY_SEED)
+    sampled_minutes = 2 * _median_minutes_table(actual, thresholds)["median_per_half"]
+    means = _mean_summary(draws)["mean_r_full"]
+    mean_r_full = float(np.interp(minutes, sampled_minutes, means))
     return pd.DataFrame([{"minutes": minutes, "mean_r_full": mean_r_full}])
 
 
@@ -778,4 +802,517 @@ def qualifying_players_figure(
     )
     # Five group names wrap the legend onto two rows, so leave room under the title.
     figure.update_layout(margin={"t": 136})
+    return figure
+
+
+def _season_column(metric: str) -> str:
+    """Return a metric's column in the season table, rejecting unknown names."""
+    for candidate in METRICS:
+        if candidate.name == metric:
+            return candidate.season_column
+    raise ValueError(f"Unknown metric: {metric}")
+
+
+def _season_rates(
+    conn: sqlite3.Connection, min_minutes: float = DEFAULT_MIN_MINUTES, group: str | None = None
+) -> pd.DataFrame:
+    """Return per-player season rates for any minutes minimum, optionally for one group.
+
+    This matches player_season_p90, whose minimum is fixed at 600, so that the
+    app's slider can reuse the same analysis at other minimums. Completion % comes
+    from season totals.
+    """
+    if group is not None and group not in _position_groups(conn):
+        raise ValueError(f"Unknown position group: {group}")
+    rates = []
+    for metric in METRICS:
+        if metric.per_90:
+            rates.append(f"SUM(pm.{metric.name}) * 90.0 / SUM(pm.minutes) AS {metric.season_column}")
+        else:
+            rates.append(
+                "SUM(pm.passes_completed) * 100.0 / NULLIF(SUM(pm.passes_attempted), 0)"
+                f" AS {metric.season_column}"
+            )
+    query = f"""
+        SELECT
+            p.player_id,
+            p.player_name,
+            p.position_group,
+            GROUP_CONCAT(DISTINCT t.team_name) AS teams,
+            COUNT(*) AS matches,
+            SUM(pm.minutes) AS minutes,
+            {", ".join(rates)}
+        FROM player_match AS pm
+        JOIN players AS p ON p.player_id = pm.player_id
+        JOIN teams AS t ON t.team_id = pm.team_id
+        WHERE p.position_group IS NOT NULL
+        GROUP BY p.player_id, p.player_name, p.position_group
+        HAVING SUM(pm.minutes) >= ?
+    """
+    season = pd.read_sql_query(query, conn, params=(min_minutes,))
+    return season if group is None else season[season["position_group"] == group]
+
+
+def descriptive_stats(
+    conn: sqlite3.Connection, group: str | None = None, min_minutes: float = DEFAULT_MIN_MINUTES
+) -> pd.DataFrame:
+    """Return n, mean, median, std, min, p10, p90 and max per position group and metric.
+
+    Each group is summarised on its own because positions differ so much that a
+    league-wide average would describe nobody. Pass group to get just one.
+    """
+    rows = []
+    for position_group, players in _season_rates(conn, min_minutes, group).groupby("position_group"):
+        for metric in METRICS:
+            values = players[metric.season_column]
+            rows.append(
+                {
+                    "position_group": position_group,
+                    "metric": metric.name,
+                    "n": int(values.count()),
+                    "mean": values.mean(),
+                    "median": values.median(),
+                    "std": values.std(),
+                    "min": values.min(),
+                    "p10": values.quantile(0.1),
+                    "p90": values.quantile(0.9),
+                    "max": values.max(),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def metric_distribution_fig(
+    conn: sqlite3.Connection, metric: str, min_minutes: float = DEFAULT_MIN_MINUTES
+) -> go.Figure:
+    """Return a box plot of one metric by position group, with every player shown.
+
+    Showing the points reveals how many players sit behind each box and who the
+    extremes are. Hovering a point gives the player, team and minutes. Boxes share
+    one color because the axis already names each group.
+    """
+    column = _season_column(metric)
+    rates = _season_rates(conn, min_minutes)
+    figure = go.Figure()
+    for group in _position_groups(conn):
+        players = rates[rates["position_group"] == group]
+        figure.add_trace(
+            go.Box(
+                x=players[column],
+                name=group,
+                orientation="h",
+                boxpoints="all",
+                jitter=0.45,
+                pointpos=0,
+                hoveron="points",
+                customdata=players[["player_name", "teams", "minutes"]].to_numpy(),
+                hovertemplate=(
+                    "<b>%{customdata[0]}</b><br>%{customdata[1]}<br>%{customdata[2]:.0f} minutes"
+                    f"<br>{metric}: %{{x:.2f}}<extra></extra>"
+                ),
+                marker={
+                    "color": SERIES_COLORS[0],
+                    "size": 8,
+                    "opacity": 0.6,
+                    "line": {"color": SURFACE, "width": 1},
+                },
+                line={"color": SERIES_COLORS[0], "width": 2},
+                fillcolor=BAND_FILL,
+            )
+        )
+    figure.update_layout(**_chart_layout(f"{column} by position group", column, "", False))
+    figure.update_xaxes(showgrid=True, gridcolor=GRID)
+    figure.update_yaxes(showgrid=False, autorange="reversed", automargin=True)
+    return figure
+
+
+def outlier_table(conn: sqlite3.Connection) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return players outside the Tukey fences, and a summary of those flags.
+
+    Within each group and metric, a player is flagged outside Q1 - 1.5 * IQR or
+    Q3 + 1.5 * IQR. Treatment: outliers are kept, because they are real
+    performances and percentiles are rank-based and robust to them, but any
+    concentration among low-minute players is noted.
+
+    The first DataFrame has player, team, group, metric, value, minutes and
+    direction. The second has, per metric and overall, the number of flags, the
+    share from players with 600-900 minutes and over 900 minutes, and the share of
+    the 600+ pool in the 600-900 band, which is the baseline for judging concentration.
+    """
+    season = pd.read_sql_query("SELECT * FROM player_season_p90", conn)
+    flags = []
+    for group, players in season.groupby("position_group"):
+        for metric in METRICS:
+            values = players[metric.season_column]
+            q1, q3 = values.quantile(0.25), values.quantile(0.75)
+            spread = OUTLIER_IQR_MULTIPLE * (q3 - q1)
+            for direction, outside in (("high", values > q3 + spread), ("low", values < q1 - spread)):
+                for _, player in players[outside].iterrows():
+                    flags.append(
+                        {
+                            "player": player["player_name"],
+                            "team": player["teams"],
+                            "group": group,
+                            "metric": metric.name,
+                            "value": player[metric.season_column],
+                            "minutes": player["minutes"],
+                            "direction": direction,
+                        }
+                    )
+    table = pd.DataFrame(flags)
+    pool_share = float((season["minutes"] <= OUTLIER_MINUTES_BAND).mean())
+
+    def summary_row(label: str, rows: pd.DataFrame) -> dict:
+        in_band = float((rows["minutes"] <= OUTLIER_MINUTES_BAND).mean()) if len(rows) else np.nan
+        return {
+            "metric": label,
+            "n_flags": len(rows),
+            "share_600_900": in_band,
+            "share_over_900": 1 - in_band,
+            "pool_share_600_900": pool_share,
+        }
+
+    summary = [summary_row(m.name, table[table["metric"] == m.name]) for m in METRICS]
+    summary.append(summary_row("ALL", table))
+    return table, pd.DataFrame(summary)
+
+
+def _outlier_check_row(conn: sqlite3.Connection) -> dict:
+    """Return the data-quality row documenting how outliers are treated."""
+    _, summary = outlier_table(conn)
+    overall = summary[summary["metric"] == "ALL"].iloc[0]
+    return {
+        "check": "Outlier flags (1.5 x IQR, within position group and metric)",
+        "count": int(overall["n_flags"]),
+        "treatment": (
+            "Kept: they are real performances, and percentiles are rank-based and robust. "
+            f"{overall['share_600_900']:.0%} of flags come from players with 600-900 minutes, "
+            f"who are {overall['pool_share_600_900']:.0%} of the 600+ pool."
+        ),
+    }
+
+
+def _spearman_matrix(players: pd.DataFrame) -> pd.DataFrame:
+    """Return the Spearman matrix of the correlation metrics, labelled by metric name."""
+    columns = {metric.season_column: metric.name for metric in CORRELATION_METRICS}
+    return players[list(columns)].rename(columns=columns).corr(method="spearman")
+
+
+def metric_correlation(
+    conn: sqlite3.Connection, group: str | None = None, min_minutes: float = DEFAULT_MIN_MINUTES
+) -> pd.DataFrame:
+    """Return the Spearman correlation matrix of the metrics, in one group or pooled.
+
+    It shows which metrics carry overlapping information. npxG stands in for xG,
+    so xG is left out to avoid a near-duplicate. A pooled matrix also reflects
+    differences between positions, which is why a group can be selected.
+    """
+    return _spearman_matrix(_season_rates(conn, min_minutes, group))
+
+
+def metric_correlation_fig(
+    conn: sqlite3.Connection, group: str | None = None, min_minutes: float = DEFAULT_MIN_MINUTES
+) -> go.Figure:
+    """Return a heatmap of the Spearman matrix, in one group or pooled.
+
+    Blue and red are opposite poles around a neutral midpoint at zero, so the
+    sign of a relationship reads at a glance. Exact values appear on hover.
+    """
+    matrix = metric_correlation(conn, group, min_minutes)
+    figure = go.Figure(
+        go.Heatmap(
+            z=matrix.to_numpy(),
+            x=list(matrix.columns),
+            y=list(matrix.index),
+            zmin=-1,
+            zmax=1,
+            colorscale=[[0.0, DIVERGING_NEGATIVE], [0.5, DIVERGING_MIDPOINT], [1.0, DIVERGING_POSITIVE]],
+            colorbar={"title": {"text": "Spearman r"}, "outlinewidth": 0},
+            xgap=2,
+            ygap=2,
+            hovertemplate="%{y} and %{x}<br>r = %{z:.2f}<extra></extra>",
+        )
+    )
+    title = f"Metric correlations: {group if group else 'all outfield players (pooled)'}"
+    figure.update_layout(**_chart_layout(title, "", "", False), height=680)
+    figure.update_xaxes(tickangle=-45, automargin=True)
+    figure.update_yaxes(autorange="reversed", automargin=True, showgrid=False)
+    return figure
+
+
+def _within_group_correlation(rates: pd.DataFrame) -> pd.DataFrame:
+    """Return the n-weighted average of within-group Spearman matrices.
+
+    Groups with fewer than MIN_GROUP_PLAYERS players are left out as too noisy.
+    """
+    total, players_used = None, 0
+    for _, players in rates.groupby("position_group"):
+        if len(players) < MIN_GROUP_PLAYERS:
+            continue
+        weighted = _spearman_matrix(players) * len(players)
+        total = weighted if total is None else total + weighted
+        players_used += len(players)
+    if total is None:
+        raise ValueError(f"No position group has at least {MIN_GROUP_PLAYERS} players")
+    return total / players_used
+
+
+def top_correlated_pairs(
+    conn: sqlite3.Connection, scope: str = "pooled", min_minutes: float = DEFAULT_MIN_MINUTES
+) -> pd.DataFrame:
+    """Return the 10 most positive and 5 most negative metric pairs for one scope.
+
+    Pooling players from different positions can create correlations that are
+    really about position: strikers shoot more and defend less than center
+    backs. Each pair therefore shows its pooled r, its n-weighted average r within
+    groups, and the difference. Scope "pooled" or "within_group" sets the ranking.
+    """
+    if scope not in SCOPE_COLUMNS:
+        raise ValueError(f"scope must be one of {sorted(SCOPE_COLUMNS)}")
+    rates = _season_rates(conn, min_minutes)
+    pooled = _spearman_matrix(rates)
+    within = _within_group_correlation(rates)
+    pairs = pd.DataFrame(
+        [
+            {
+                "metric_a": first,
+                "metric_b": second,
+                "pooled_r": pooled.loc[first, second],
+                "within_group_r": within.loc[first, second],
+            }
+            for first, second in combinations(pooled.columns, 2)
+        ]
+    )
+    pairs["pooled_minus_within"] = pairs["pooled_r"] - pairs["within_group_r"]
+    column = SCOPE_COLUMNS[scope]
+    ranked = pairs.sort_values(column, ascending=False)
+    positive = ranked[ranked[column] > 0].head(10).assign(direction="positive")
+    negative = ranked[ranked[column] < 0].tail(5).iloc[::-1].assign(direction="negative")
+    columns = ["direction", "metric_a", "metric_b", "pooled_r", "within_group_r", "pooled_minus_within"]
+    return pd.concat([positive, negative], ignore_index=True)[columns]
+
+
+def _team_match_rows(conn: sqlite3.Connection) -> pd.DataFrame:
+    """Return one row per team per match with goals, points and npxG for and against."""
+    query = """
+        WITH team_matches AS (
+            SELECT match_id, home_team_id AS team_id, away_team_id AS opponent_id,
+                   home_score AS goals_for, away_score AS goals_against
+            FROM matches
+            UNION ALL
+            SELECT match_id, away_team_id, home_team_id, away_score, home_score
+            FROM matches
+        ),
+        team_npxg AS (
+            SELECT match_id, team_id, SUM(npxg) AS npxg
+            FROM player_match
+            GROUP BY match_id, team_id
+        )
+        SELECT
+            tm.match_id,
+            t.team_name AS team,
+            tm.goals_for,
+            tm.goals_against,
+            CASE
+                WHEN tm.goals_for > tm.goals_against THEN 3
+                WHEN tm.goals_for = tm.goals_against THEN 1
+                ELSE 0
+            END AS points,
+            ours.npxg AS npxg_for,
+            theirs.npxg AS npxg_against
+        FROM team_matches AS tm
+        JOIN teams AS t ON t.team_id = tm.team_id
+        JOIN team_npxg AS ours ON ours.match_id = tm.match_id AND ours.team_id = tm.team_id
+        JOIN team_npxg AS theirs ON theirs.match_id = tm.match_id AND theirs.team_id = tm.opponent_id
+    """
+    return pd.read_sql_query(query, conn)
+
+
+def team_season_table(conn: sqlite3.Connection) -> pd.DataFrame:
+    """Return the league table with results, goals and non-penalty xG for each team.
+
+    It connects player metrics to team results. npxG against is the opponent's
+    sum in the same match. Teams are ordered by points, goal difference, then goals.
+    """
+    rows = _team_match_rows(conn)
+    table = (
+        rows.groupby("team")
+        .agg(
+            matches=("match_id", "count"),
+            wins=("points", lambda points: int((points == 3).sum())),
+            draws=("points", lambda points: int((points == 1).sum())),
+            losses=("points", lambda points: int((points == 0).sum())),
+            points=("points", "sum"),
+            goals_for=("goals_for", "sum"),
+            goals_against=("goals_against", "sum"),
+            npxg_for=("npxg_for", "sum"),
+            npxg_against=("npxg_against", "sum"),
+        )
+        .reset_index()
+    )
+    table["goal_difference"] = table["goals_for"] - table["goals_against"]
+    table["npxg_difference"] = table["npxg_for"] - table["npxg_against"]
+    columns = [
+        "team",
+        "matches",
+        "wins",
+        "draws",
+        "losses",
+        "points",
+        "goals_for",
+        "goals_against",
+        "goal_difference",
+        "npxg_for",
+        "npxg_against",
+        "npxg_difference",
+    ]
+    return table.sort_values(
+        ["points", "goal_difference", "goals_for"], ascending=False, ignore_index=True
+    )[columns]
+
+
+def team_season_checks(conn: sqlite3.Connection) -> pd.DataFrame:
+    """Return the validation checks on the team table as check, passed and detail.
+
+    A league table has strict arithmetic, so these catch join errors: every team
+    plays the same number of matches, each match awards 2 or 3 points, and goals
+    and npxG balance between for and against. The order check tests that points
+    broadly follow goal difference.
+    """
+    rows = _team_match_rows(conn)
+    table = team_season_table(conn)
+    wrong_matches = table.loc[table["matches"] != SEASON_MATCHES, "team"].tolist()
+    points_per_match = rows.groupby("match_id")["points"].sum()
+    wrong_points = int((~points_per_match.isin([2, 3])).sum())
+    goal_gap = int(table["goals_for"].sum() - table["goals_against"].sum())
+    npxg_gap = float(table["npxg_for"].sum() - table["npxg_against"].sum())
+    player_npxg = conn.execute("SELECT SUM(npxg) FROM player_match").fetchone()[0]
+    total_gap = float(table["npxg_for"].sum() - player_npxg)
+    order_r = float(table[["points", "goal_difference"]].corr(method="spearman").iloc[0, 1])
+    checks = [
+        (
+            f"Every team has {SEASON_MATCHES} matches",
+            not wrong_matches,
+            f"{len(table)} teams; teams with another count: {wrong_matches or 'none'}",
+        ),
+        (
+            "Each match awards 2 or 3 points",
+            wrong_points == 0,
+            f"{len(points_per_match)} matches; {wrong_points} outside 2 or 3",
+        ),
+        ("Goals for equal goals against", goal_gap == 0, f"difference {goal_gap}"),
+        ("npxG for equals npxG against", abs(npxg_gap) < TOTALS_TOLERANCE, f"difference {npxg_gap:.6f}"),
+        (
+            "Team npxG equals player_match npxG",
+            abs(total_gap) < TOTALS_TOLERANCE,
+            f"difference {total_gap:.6f}",
+        ),
+        (
+            f"Points order follows goal difference (Spearman >= {PLAUSIBLE_ORDER_R})",
+            order_r >= PLAUSIBLE_ORDER_R,
+            f"Spearman {order_r:.3f}; top {table['team'].iloc[0]}, bottom {table['team'].iloc[-1]}",
+        ),
+    ]
+    return pd.DataFrame(checks, columns=["check", "passed", "detail"])
+
+
+def _correlation_row(label: str, x: pd.Series, y: pd.Series) -> dict:
+    """Return Pearson and Spearman r and the least-squares line for two columns."""
+    slope, intercept = np.polyfit(x, y, 1)
+    return {
+        "relationship": label,
+        "n": len(x),
+        "pearson_r": float(np.corrcoef(x, y)[0, 1]),
+        "spearman_r": float(np.corrcoef(x.rank(), y.rank())[0, 1]),
+        "slope": float(slope),
+        "intercept": float(intercept),
+    }
+
+
+def team_level_correlations(conn: sqlite3.Connection) -> pd.DataFrame:
+    """Return team-level correlations of npxG difference with points and goal difference.
+
+    They test whether chance quality tracks results. With only 12 teams these
+    correlations are approximate, and a few teams can move them.
+    """
+    table = team_season_table(conn)
+    return pd.DataFrame(
+        [
+            _correlation_row("npxg_difference vs points", table["npxg_difference"], table["points"]),
+            _correlation_row(
+                "npxg_difference vs goal_difference",
+                table["npxg_difference"],
+                table["goal_difference"],
+            ),
+        ]
+    )
+
+
+def _team_label_positions(table: pd.DataFrame) -> list[str]:
+    """Return a label side per team that avoids collisions and the plot edges.
+
+    Teams near either edge are labelled toward the center. The rest alternate
+    sides in points order, so teams with similar points do not share a side.
+    """
+    x = table["npxg_difference"]
+    edge = (x.max() - x.min()) / 4
+    points_order = table["points"].rank(method="first", ascending=False).astype(int) - 1
+    positions = []
+    for value, order in zip(x, points_order):
+        if value > x.max() - edge:
+            positions.append("middle left")
+        elif value < x.min() + edge:
+            positions.append("middle right")
+        else:
+            positions.append("middle left" if order % 2 else "middle right")
+    return positions
+
+
+def team_npxg_vs_points_fig(conn: sqlite3.Connection) -> go.Figure:
+    """Return a scatter of npxG difference against points, with a least-squares line.
+
+    A team above the line earned more points than its chance difference suggests.
+    """
+    table = team_season_table(conn).sort_values("npxg_difference", ignore_index=True)
+    fit = _correlation_row("fit", table["npxg_difference"], table["points"])
+    line_x = np.array([table["npxg_difference"].min(), table["npxg_difference"].max()])
+    figure = go.Figure()
+    figure.add_trace(
+        go.Scatter(
+            x=line_x,
+            y=fit["slope"] * line_x + fit["intercept"],
+            mode="lines",
+            name="Least-squares line",
+            line={"color": TEXT_SECONDARY, "width": 2, "dash": "dash"},
+            hoverinfo="skip",
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=table["npxg_difference"],
+            y=table["points"],
+            mode="markers+text",
+            name="Team",
+            text=table["team"],
+            textposition=_team_label_positions(table),
+            textfont={"color": TEXT_SECONDARY, "size": 11},
+            marker={"color": SERIES_COLORS[0], "size": 11, "line": {"color": SURFACE, "width": 2}},
+            hovertemplate="%{text}<br>npxG difference: %{x:.1f}<br>Points: %{y}<extra></extra>",
+        )
+    )
+    figure.update_layout(
+        **_chart_layout("Non-penalty xG difference and points", "npxG difference", "Points", True)
+    )
+    figure.update_xaxes(showgrid=True, gridcolor=GRID)
+    figure.add_annotation(
+        x=1,
+        xref="paper",
+        y=0,
+        yref="paper",
+        xanchor="right",
+        yanchor="bottom",
+        showarrow=False,
+        text=f"n = {fit['n']}, Pearson r = {fit['pearson_r']:.2f}, Spearman r = {fit['spearman_r']:.2f}",
+        font={"color": TEXT_SECONDARY, "size": 12},
+    )
     return figure
