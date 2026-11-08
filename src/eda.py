@@ -29,7 +29,20 @@ SEASON_MATCHES = 22
 PLAUSIBLE_ORDER_R = 0.80
 TOTALS_TOLERANCE = 1e-6
 SCOPE_COLUMNS = {"pooled": "pooled_r", "within_group": "within_group_r"}
-CORRELATION_METRICS = [metric for metric in METRICS if metric.name != "xg"]
+CORRELATION_METRICS = [metric for metric in METRICS if metric.name not in ("xg", "shots")]
+COMPARISON_CUTOFF = 900
+PLATEAU_GAIN = 0.02
+TEAM_EXTREMES = 2
+STRIKER = "Striker"
+CENTER_BACK = "Center Back"
+METRIC_LABELS = {
+    "npxg": "npxG",
+    "xg": "xG",
+    "xa": "xA",
+    "np_shots": "non-penalty shots",
+    "pass_completion_pct": "pass completion %",
+    "tackles_interceptions": "tackles won plus interceptions",
+}
 HIGH_RELIABILITY = 0.70
 MODERATE_RELIABILITY = 0.55
 RELIABILITY_NOTES = {
@@ -1003,9 +1016,10 @@ def metric_correlation(
 ) -> pd.DataFrame:
     """Return the Spearman correlation matrix of the metrics, in one group or pooled.
 
-    It shows which metrics carry overlapping information. npxG stands in for xG,
-    so xG is left out to avoid a near-duplicate. A pooled matrix also reflects
-    differences between positions, which is why a group can be selected.
+    It shows which metrics carry overlapping information. npxG and non-penalty
+    shots stand in for xG and shots, which are left out as near-duplicates. A
+    pooled matrix also reflects differences between positions, which is why a
+    group can be selected.
     """
     return _spearman_matrix(_season_rates(conn, min_minutes, group))
 
@@ -1316,3 +1330,244 @@ def team_npxg_vs_points_fig(conn: sqlite3.Connection) -> go.Figure:
         font={"color": TEXT_SECONDARY, "size": 12},
     )
     return figure
+
+
+def _metric_label(name: str) -> str:
+    """Return a metric's name as it should read in a sentence."""
+    return METRIC_LABELS.get(name, name.replace("_", " "))
+
+
+def _group_median(stats: pd.DataFrame, group: str, metric: str) -> float:
+    """Return one group's median for one metric from descriptive_stats output."""
+    row = stats[(stats["position_group"] == group) & (stats["metric"] == metric)]
+    return float(row["median"].iloc[0])
+
+
+def _pair_correlations(
+    conn: sqlite3.Connection, first: str, second: str, min_minutes: float
+) -> tuple[float, float]:
+    """Return a metric pair's pooled r and n-weighted average within-group r."""
+    pooled = metric_correlation(conn, None, min_minutes)
+    within = _within_group_correlation(_season_rates(conn, min_minutes))
+    return float(pooled.loc[first, second]), float(within.loc[first, second])
+
+
+def _threshold_insight(conn: sqlite3.Connection, min_minutes: float) -> dict:
+    """Return the insight on how reliability grows and what a higher cutoff costs."""
+    means = stability_mean_range(conn).sort_values("threshold")
+    gains = means["mean_r_full"].diff().dropna()
+    if (gains > 0).all() and gains.iloc[-1] >= PLATEAU_GAIN:
+        trend = "rises at every step and does not plateau"
+    elif (gains > 0).all():
+        trend = "rises at every step but flattens at the end"
+    else:
+        trend = "does not rise at every step"
+
+    at_minimum = reliability_at_minutes(conn, min_minutes)["mean_r_full"].iloc[0]
+    at_cutoff = reliability_at_minutes(conn, COMPARISON_CUTOFF)["mean_r_full"].iloc[0]
+    text = (
+        f"Mean reliability across metrics {trend}: the last step, from T = "
+        f"{means['threshold'].iloc[-2]} to T = {means['threshold'].iloc[-1]}, adds "
+        f"{gains.iloc[-1]:.2f}. It is {at_minimum:.2f} at about {min_minutes:g} actual minutes "
+        "of data"
+    )
+    if min_minutes < COMPARISON_CUTOFF:
+        table = minutes_threshold_table(conn, (min_minutes, COMPARISON_CUTOFF))
+        current, stricter = table.iloc[0], table.iloc[1]
+        text += (
+            f" and {at_cutoff:.2f} at about {COMPARISON_CUTOFF}. "
+            f"A {COMPARISON_CUTOFF}-minute cutoff would drop {current['total'] - stricter['total']} "
+            f"of {current['total']} players, including "
+            f"{current[STRIKER] - stricter[STRIKER]} of {current[STRIKER]} strikers."
+        )
+    else:
+        text += f". The current minimum is already at or above {COMPARISON_CUTOFF}."
+    return {
+        "id": "threshold",
+        "section": "Minutes threshold",
+        "title": "Reliability keeps rising with minutes",
+        "text": text,
+    }
+
+
+def _tiers_insight(conn: sqlite3.Connection, min_minutes: float) -> dict:
+    """Return the insight listing which metrics are high and low reliability."""
+    threshold = min(min_minutes, 2 * POOL_HALF_MINUTES)
+    reliability = metric_reliability(conn, threshold)
+    actual = 2 * median_minutes_per_half(conn, (threshold,))["median_per_half"].iloc[0]
+
+    def names(tier: str) -> str:
+        members = reliability.loc[reliability["tier"] == tier, "metric"]
+        return ", ".join(_metric_label(name) for name in members) or "none"
+
+    moderate = int((reliability["tier"] == "moderate").sum())
+    return {
+        "id": "reliability_tiers",
+        "section": "Reliability",
+        "title": "Which metrics can be trusted at this sample size",
+        "text": (
+            f"At T = {threshold:g} (samples of about {actual:.0f} actual minutes), the high-tier "
+            f"metrics (r_full at least {HIGH_RELIABILITY:.2f}) are {names('high')}. The low-tier "
+            f"metrics (below {MODERATE_RELIABILITY:.2f}) are {names('low')}. "
+            f"The other {moderate} are moderate."
+        ),
+    }
+
+
+def _position_insight(conn: sqlite3.Connection, min_minutes: float) -> dict:
+    """Return the insight comparing position groups on shooting and progression."""
+    stats = descriptive_stats(conn, min_minutes=min_minutes)
+    progressive = stats[stats["metric"] == "progressive_passes"].nlargest(2, "median")
+    first, second = progressive.iloc[0], progressive.iloc[1]
+    return {
+        "id": "position_profiles",
+        "section": "Position profiles",
+        "title": "Positions differ on shooting and progression",
+        "text": (
+            f"Median npxG per 90 is {_group_median(stats, STRIKER, 'npxg'):.2f} for strikers and "
+            f"{_group_median(stats, CENTER_BACK, 'npxg'):.2f} for center backs. Median progressive "
+            f"passes per 90 are highest for {first['position_group']} ({first['median']:.2f}) and "
+            f"{second['position_group']} ({second['median']:.2f})."
+        ),
+    }
+
+
+def _confounding_insight(conn: sqlite3.Connection, min_minutes: float) -> dict:
+    """Return the insight showing position confounding a pooled correlation."""
+    pooled, within = _pair_correlations(conn, "np_shots", "passes_completed", min_minutes)
+    stats = descriptive_stats(conn, min_minutes=min_minutes)
+    sign = "changes sign" if pooled * within < 0 else "keeps its sign"
+    return {
+        "id": "confounding",
+        "section": "Correlations",
+        "title": "Position can distort a pooled correlation",
+        "text": (
+            f"Non-penalty shots and completed passes have a pooled r of {pooled:.2f} and a "
+            f"within-group r of {within:.2f}, so the relationship {sign} once position is held "
+            f"constant. Strikers have a median of {_group_median(stats, STRIKER, 'np_shots'):.1f} "
+            f"non-penalty shots and {_group_median(stats, STRIKER, 'passes_completed'):.1f} "
+            f"completed passes per 90, against "
+            f"{_group_median(stats, CENTER_BACK, 'np_shots'):.1f} and "
+            f"{_group_median(stats, CENTER_BACK, 'passes_completed'):.1f} for center backs, so the "
+            "pooled figure partly reflects differences between positions."
+        ),
+    }
+
+
+def _pooling_insight(conn: sqlite3.Connection, min_minutes: float) -> dict:
+    """Return the insight on a link that pooling across positions hides."""
+    pooled, within = _pair_correlations(
+        conn, "key_passes", "passes_into_final_third", min_minutes
+    )
+    effect = "hides" if abs(pooled) < abs(within) else "does not hide"
+    stats = descriptive_stats(conn, min_minutes=min_minutes)
+
+    def leader(metric: str) -> str:
+        rows = stats[stats["metric"] == metric]
+        return rows.loc[rows["median"].idxmax(), "position_group"]
+
+    final_third_leader, key_pass_leader = leader("passes_into_final_third"), leader("key_passes")
+    if final_third_leader == key_pass_leader:
+        explanation = f"{final_third_leader} has the highest median on both."
+    else:
+        explanation = (
+            f"{final_third_leader} has the highest median for passes into the final third and "
+            f"{key_pass_leader} the highest for key passes, so comparing across positions "
+            "mixes two different roles."
+        )
+    return {
+        "id": "pooling_hides_links",
+        "section": "Correlations",
+        "title": "Pooling can also hide a relationship",
+        "text": (
+            f"Key passes and passes into the final third have a pooled r of {pooled:.2f} and a "
+            f"within-group r of {within:.2f}, so pooling {effect} this link. {explanation}"
+        ),
+    }
+
+
+def _pressing_insight(conn: sqlite3.Connection, min_minutes: float) -> dict:
+    """Return the insight on pressing and passing within position groups."""
+    _, within = _pair_correlations(conn, "passes_completed", "pressures", min_minutes)
+    direction = "fewer" if within < 0 else "more"
+    return {
+        "id": "pressing_vs_passing",
+        "section": "Correlations",
+        "title": "Pressing and passing within positions",
+        "text": (
+            f"Within position groups, pressures and completed passes have an average r of "
+            f"{within:.2f}: players who press more tend to complete {direction} passes. Team "
+            "style may contribute, and this analysis does not control for it."
+        ),
+    }
+
+
+def _team_insight(conn: sqlite3.Connection) -> dict:
+    """Return the insight linking team chance quality to results, with its caveat."""
+    correlations = team_level_correlations(conn).set_index("relationship")
+    points_row = correlations.loc["npxg_difference vs points"]
+    goals_row = correlations.loc["npxg_difference vs goal_difference"]
+    table = team_season_table(conn).sort_values("npxg_difference", ignore_index=True)
+
+    fitted = goals_row["slope"] * table["npxg_difference"] + goals_row["intercept"]
+    residuals = table["goal_difference"] - fitted
+    largest = residuals.abs().idxmax()
+    direction = "overperformed" if residuals[largest] > 0 else "underperformed"
+    middle = table.iloc[TEAM_EXTREMES:-TEAM_EXTREMES]
+    middle_r = float(np.corrcoef(middle["npxg_difference"], middle["points"])[0, 1])
+    n_teams = int(points_row["n"])
+    return {
+        "id": "team_level",
+        "section": "Team level",
+        "title": "Chance quality tracks results across teams",
+        "text": (
+            f"Across {n_teams} teams, npxG difference and points have a Pearson r of "
+            f"{points_row['pearson_r']:.2f}. {table['team'][largest]} has the largest gap between "
+            f"goal difference and the value fitted from npxG difference: "
+            f"{table['goal_difference'][largest]} against a fitted {fitted[largest]:.1f}, so it "
+            f"{direction} by {abs(residuals[largest]):.1f} goals. With only {n_teams} teams, the "
+            f"extreme clubs drive the correlation: without the {TEAM_EXTREMES} highest and "
+            f"{TEAM_EXTREMES} lowest teams by npxG difference, r is {middle_r:.2f}."
+        ),
+    }
+
+
+def _outlier_insight(conn: sqlite3.Connection) -> dict:
+    """Return the insight on outlier flags and the decision to keep them."""
+    _, summary = outlier_table(conn)
+    overall = summary[summary["metric"] == "ALL"].iloc[0]
+    in_band, pool = overall["share_600_900"], overall["pool_share_600_900"]
+    concentration = "are not concentrated" if in_band <= pool else "are concentrated"
+    return {
+        "id": "outliers",
+        "section": "Outliers",
+        "title": "Outliers are kept",
+        "text": (
+            f"There are {int(overall['n_flags'])} outlier flags ({OUTLIER_IQR_MULTIPLE} x IQR, "
+            f"within position group and metric, among players with at least {DEFAULT_MIN_MINUTES} "
+            f"minutes). Players with {DEFAULT_MIN_MINUTES} to {OUTLIER_MINUTES_BAND} minutes account "
+            f"for {in_band:.0%} of flags and {pool:.0%} of the pool, so flags {concentration} in "
+            "low-minute players. They are kept because they are real performances and percentiles "
+            "are rank-based."
+        ),
+    }
+
+
+def eda_insights(conn: sqlite3.Connection, min_minutes: float = DEFAULT_MIN_MINUTES) -> list[dict]:
+    """Return the EDA findings as a list of dicts with id, section, title and text.
+
+    The app and the LLM module can show these directly. Every number is computed
+    from the database when this runs, so the text stays correct if the data or
+    the minutes setting changes. Team results and outliers do not depend on the
+    minutes setting: the outlier analysis always uses the 600-minute view.
+    """
+    return [
+        _threshold_insight(conn, min_minutes),
+        _tiers_insight(conn, min_minutes),
+        _position_insight(conn, min_minutes),
+        _confounding_insight(conn, min_minutes),
+        _pooling_insight(conn, min_minutes),
+        _pressing_insight(conn, min_minutes),
+        _team_insight(conn),
+        _outlier_insight(conn),
+    ]
