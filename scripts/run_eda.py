@@ -32,6 +32,18 @@ def stability_pivot(stability: pd.DataFrame) -> pd.DataFrame:
     return table
 
 
+def stability_range_pivot(stability: pd.DataFrame) -> pd.DataFrame:
+    """Return each metric's 10th to 90th percentile of r_full as metric x threshold text."""
+    ranges = stability.assign(
+        r_full_range=[
+            f"{low:.2f}-{high:.2f}"
+            for low, high in zip(stability["r_full_p10"], stability["r_full_p90"])
+        ]
+    )
+    pivot = ranges.pivot(index="metric", columns="threshold", values="r_full_range")
+    return pivot.reindex([metric.name for metric in METRICS])
+
+
 def print_section(title: str, table: pd.DataFrame, index: bool = False) -> None:
     """Print a titled table."""
     print(f"\n=== {title} ===")
@@ -61,9 +73,12 @@ def main() -> None:
         print_section("Data quality", eda.data_quality_summary(connection))
         print_section("Qualifying outfield players by threshold", eda.minutes_threshold_table(connection))
         print_section("Season split", eda.season_split(connection))
-        print_section("Reliability (r_full): metric x threshold", stability_pivot(stability), index=True)
-        print_section("Group and threshold combinations skipped (n < 8)", eda.stability_skipped_groups(connection))
-        print_section("Median minutes per half, included players", eda.median_minutes_per_half(connection))
+        print_section("Stability pool: 600+ minutes in each half", eda.stability_pool_sizes(connection))
+        print_section("Position groups skipped (n < 8)", eda.stability_skipped_groups(connection))
+        print_section("Reliability at about T minutes: mean r_full", stability_pivot(stability), index=True)
+        print_section("10-90% of draws, per metric", stability_range_pivot(stability), index=True)
+        print_section("Mean across metrics, 10-90% of draws", eda.stability_mean_range(connection).round(3))
+        print_section("Median actual minutes per half", eda.median_minutes_per_half(connection).round(1))
         if arguments.figures_dir:
             save_figures(connection, arguments.figures_dir)
             print(f"\nSaved figures to {arguments.figures_dir}")

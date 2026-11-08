@@ -7,15 +7,21 @@ database alone.
 
 import re
 import sqlite3
+from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
 from src.metrics import METRICS
 
 DEFAULT_THRESHOLDS = (300, 400, 600, 900, 1200)
+STABILITY_THRESHOLDS = (200, 300, 400, 600, 900, 1200)
+STABILITY_DRAWS = 200
+STABILITY_SEED = 42
+POOL_HALF_MINUTES = 600
+RATE_DECIMALS = 9
 MIN_GROUP_PLAYERS = 8
-COMPLETION_METRIC = "pass_completion_pct"
 FIRST = "first"
 SECOND = "second"
 HISTOGRAM_BIN_MINUTES = 100
@@ -25,6 +31,7 @@ TEXT_PRIMARY = "#0b0b0b"
 TEXT_SECONDARY = "#52514e"
 GRID = "#e4e3df"
 CONTEXT_LINE = "#c3c2b7"
+BAND_FILL = "rgba(42, 120, 214, 0.22)"
 SERIES_COLORS = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4")
 
 
@@ -244,149 +251,282 @@ def season_split(conn: sqlite3.Connection) -> pd.DataFrame:
     return pd.read_sql_query(query, conn, params=(_last_week_of_first_half(conn),))
 
 
-def _half_rates(conn: sqlite3.Connection) -> pd.DataFrame:
-    """Return one row per outfield player with minutes and all metrics for each half.
+@dataclass(frozen=True)
+class _StabilityPool:
+    """The fixed players in the stability analysis and their match-by-match numbers.
 
-    Columns are (name, half) pairs, for example ("xg", "first"). A player absent
-    from a half has missing values there. Completion % comes from that half's
-    totals, and counts are converted to per-90 rates using that half's minutes.
+    Each entry of first and second is one player's matches in that half, as an
+    array with one row per match and one column per name in column_index.
     """
-    per_90_metrics = [metric.name for metric in METRICS if metric.per_90]
-    sums = ",\n            ".join(f"SUM(pm.{name}) AS {name}" for name in per_90_metrics)
+
+    groups: np.ndarray
+    first: list[np.ndarray]
+    second: list[np.ndarray]
+    column_index: dict[str, int]
+
+
+def _pool_match_rows(conn: sqlite3.Connection) -> pd.DataFrame:
+    """Return match rows for outfield players with enough minutes in each half.
+
+    The pool needs POOL_HALF_MINUTES in both halves, the amount required to
+    evaluate the highest threshold. Rows are sorted so that a seed always
+    produces the same draws.
+    """
+    sums = ", ".join(f"pm.{column}" for column in _stability_columns())
     query = f"""
         SELECT
             pm.player_id,
             p.position_group,
             CASE WHEN m.match_week <= ? THEN '{FIRST}' ELSE '{SECOND}' END AS half,
-            SUM(pm.minutes) AS minutes,
-            SUM(pm.passes_attempted) AS passes_attempted,
             {sums}
         FROM player_match AS pm
         JOIN players AS p ON p.player_id = pm.player_id
         JOIN matches AS m ON m.match_id = pm.match_id
         WHERE p.position_group IS NOT NULL
-        GROUP BY pm.player_id, p.position_group, half
+        ORDER BY pm.player_id, pm.match_id
     """
-    totals = pd.read_sql_query(query, conn, params=(_last_week_of_first_half(conn),))
-
-    rates = totals[["player_id", "position_group", "half", "minutes"]].copy()
-    for name in per_90_metrics:
-        rates[name] = totals[name] * 90 / totals["minutes"]
-    attempted = totals["passes_attempted"]
-    rates[COMPLETION_METRIC] = 100 * totals["passes_completed"] / attempted.where(attempted > 0)
-    return rates.pivot(index=["player_id", "position_group"], columns="half")
+    rows = pd.read_sql_query(query, conn, params=(_last_week_of_first_half(conn),))
+    half_minutes = rows.groupby(["player_id", "half"])["minutes"].sum().unstack()
+    in_pool = half_minutes[
+        (half_minutes[FIRST] >= POOL_HALF_MINUTES) & (half_minutes[SECOND] >= POOL_HALF_MINUTES)
+    ].index
+    return rows[rows["player_id"].isin(in_pool)]
 
 
-def _included_groups(
-    halves: pd.DataFrame, threshold: int
-) -> tuple[dict[str, pd.DataFrame], list[dict]]:
-    """Return the groups analysed at a threshold, and the groups skipped for small n.
+def _stability_columns() -> list[str]:
+    """Return the player_match columns the stability samples add up."""
+    return ["minutes", "passes_attempted", *[m.name for m in METRICS if m.per_90]]
 
-    A player needs at least half the threshold in each half of the season.
+
+def stability_pool_sizes(conn: sqlite3.Connection) -> pd.DataFrame:
+    """Return the fixed stability pool's size per position group, with a total row.
+
+    Every threshold uses these same players, so differences between thresholds
+    come from minutes rather than from who is in the sample. A group below
+    MIN_GROUP_PLAYERS is marked as not included.
     """
-    half_minimum = threshold / 2
-    eligible = halves[
-        (halves[("minutes", FIRST)] >= half_minimum)
-        & (halves[("minutes", SECOND)] >= half_minimum)
-    ]
-    included, skipped = {}, []
-    for group, players in eligible.groupby(level="position_group"):
-        if len(players) < MIN_GROUP_PLAYERS:
-            skipped.append({"threshold": threshold, "position_group": group, "n_players": len(players)})
-        else:
-            included[group] = players
-    return included, skipped
+    sizes = _pool_match_rows(conn).groupby("position_group")["player_id"].nunique()
+    table = sizes.rename("n_players").reset_index()
+    table["included"] = table["n_players"] >= MIN_GROUP_PLAYERS
+    total = pd.DataFrame(
+        [{"position_group": "Total", "n_players": int(sizes.sum()), "included": True}]
+    )
+    return pd.concat([table, total], ignore_index=True)
 
 
-def _weighted_split_correlation(groups: dict[str, pd.DataFrame], metric: str) -> tuple[float, int]:
-    """Return a metric's n-weighted within-group Spearman correlation and total n.
-
-    Correlating within groups stops the gap between positions (strikers shoot
-    more than center backs in both halves) from inflating the result. Spearman
-    is computed as the Pearson correlation of average ranks, which handles ties.
-    """
-    weighted_sum, total_n = 0.0, 0
-    for players in groups.values():
-        pair = players[[(metric, FIRST), (metric, SECOND)]].dropna()
-        ranks = pair.rank()
-        correlation = ranks[(metric, FIRST)].corr(ranks[(metric, SECOND)])
-        weighted_sum += correlation * len(pair)
-        total_n += len(pair)
-    return (weighted_sum / total_n if total_n else float("nan")), total_n
-
-
-def _spearman_brown(r_split: float) -> float:
-    """Return the Spearman-Brown estimate 2r / (1 + r), undefined at r = -1."""
-    return 2 * r_split / (1 + r_split) if r_split > -1 else float("nan")
-
-
-def stability_by_threshold(
-    conn: sqlite3.Connection, thresholds: tuple[int, ...] = DEFAULT_THRESHOLDS
-) -> pd.DataFrame:
-    """Return the split-half stability of every metric at each minutes threshold.
-
-    A metric only helps a scout if it measures something repeatable about the
-    player. For each threshold T, this takes outfield players with at least T/2
-    minutes in each half and correlates their per-90 values between halves.
-    The long result has threshold, metric, n_players, r_split and r_full, where
-    r_full = 2r / (1 + r) estimates the reliability of a full-season sample.
-
-    r_full describes the players actually included, and most of them exceed T/2
-    in each half by a wide margin, so see median_minutes_per_half when reading it.
-    """
-    halves = _half_rates(conn)
-    rows = []
-    for threshold in thresholds:
-        groups, _ = _included_groups(halves, threshold)
-        for metric in METRICS:
-            r_split, n_players = _weighted_split_correlation(groups, metric.name)
-            rows.append(
-                {
-                    "threshold": threshold,
-                    "metric": metric.name,
-                    "n_players": n_players,
-                    "r_split": r_split,
-                    "r_full": _spearman_brown(r_split),
-                }
-            )
-    return pd.DataFrame(rows)
-
-
-def stability_skipped_groups(
-    conn: sqlite3.Connection, thresholds: tuple[int, ...] = DEFAULT_THRESHOLDS
-) -> pd.DataFrame:
-    """Return the group and threshold combinations left out for having n < 8.
+def stability_skipped_groups(conn: sqlite3.Connection) -> pd.DataFrame:
+    """Return the position groups left out of the stability pool for having n < 8.
 
     A rank correlation on so few players is mostly noise. Recording what was
     dropped shows which position groups the stability averages do not cover.
     """
-    halves = _half_rates(conn)
-    skipped = [row for t in thresholds for row in _included_groups(halves, t)[1]]
-    return pd.DataFrame(skipped, columns=["threshold", "position_group", "n_players"])
+    sizes = stability_pool_sizes(conn)
+    return sizes.loc[~sizes["included"], ["position_group", "n_players"]].reset_index(drop=True)
+
+
+def _stability_pool(conn: sqlite3.Connection) -> _StabilityPool:
+    """Return the pool as arrays, leaving out groups that are too small."""
+    columns = _stability_columns()
+    rows = _pool_match_rows(conn)
+    group_sizes = rows.groupby("position_group")["player_id"].transform("nunique")
+    rows = rows[group_sizes >= MIN_GROUP_PLAYERS]
+
+    groups, first, second = [], [], []
+    for _, player in rows.groupby("player_id", sort=True):
+        groups.append(player["position_group"].iloc[0])
+        first.append(player.loc[player["half"] == FIRST, columns].to_numpy(dtype=float))
+        second.append(player.loc[player["half"] == SECOND, columns].to_numpy(dtype=float))
+    column_index = {name: position for position, name in enumerate(columns)}
+    return _StabilityPool(np.array(groups), first, second, column_index)
+
+
+def _sample_rates(totals: np.ndarray, column_index: dict[str, int]) -> np.ndarray:
+    """Return per-90 values for sampled totals, one row per player, one column per metric.
+
+    Completion % is built from the sample's totals rather than match percentages.
+    """
+    minutes = totals[:, column_index["minutes"]]
+    rates = np.empty((len(totals), len(METRICS)))
+    for position, metric in enumerate(METRICS):
+        if metric.per_90:
+            rates[:, position] = totals[:, column_index[metric.name]] * 90 / minutes
+        else:
+            completed = totals[:, column_index["passes_completed"]]
+            rates[:, position] = 100 * completed / totals[:, column_index["passes_attempted"]]
+    # Adding minutes in a different order can change the last floating-point digits,
+    # which would split true ties when ranking.
+    return rates.round(RATE_DECIMALS)
+
+
+def _column_spearman(first: np.ndarray, second: np.ndarray) -> np.ndarray:
+    """Return the Spearman correlation between matching columns of two arrays.
+
+    Spearman is the Pearson correlation of average ranks, which handles ties.
+    """
+    first_ranks = pd.DataFrame(first).rank().to_numpy()
+    second_ranks = pd.DataFrame(second).rank().to_numpy()
+    first_ranks = first_ranks - first_ranks.mean(axis=0)
+    second_ranks = second_ranks - second_ranks.mean(axis=0)
+    covariance = (first_ranks * second_ranks).sum(axis=0)
+    return covariance / np.sqrt((first_ranks**2).sum(axis=0) * (second_ranks**2).sum(axis=0))
+
+
+def _weighted_split_correlations(
+    first: np.ndarray, second: np.ndarray, groups: np.ndarray
+) -> np.ndarray:
+    """Return each metric's n-weighted average of within-group Spearman correlations.
+
+    Correlating within groups stops the gap between positions (strikers shoot
+    more than center backs in both halves) from inflating the result.
+    """
+    weighted = np.zeros(first.shape[1])
+    for group in np.unique(groups):
+        members = groups == group
+        weighted += _column_spearman(first[members], second[members]) * members.sum()
+    return weighted / len(groups)
+
+
+def _spearman_brown(r_split: np.ndarray) -> np.ndarray:
+    """Return the Spearman-Brown estimate 2r / (1 + r), undefined at r = -1."""
+    return np.where(r_split > -1, 2 * r_split / (1 + r_split), np.nan)
+
+
+def _stability_draws(
+    conn: sqlite3.Connection, thresholds: tuple[int, ...], n_draws: int, seed: int
+) -> tuple[pd.DataFrame, np.ndarray]:
+    """Return per-draw correlations and the actual minutes used in every sample.
+
+    In each draw, every player's matches in each half are shuffled once and
+    added up until the minutes reach T/2. Sharing that order across thresholds
+    means a higher threshold extends the same sample, so differences between
+    thresholds are not blurred by unrelated random draws.
+
+    The DataFrame has draw, threshold, metric, n_players, r_split and r_full. The
+    array of actual minutes is indexed by draw, threshold, player and half.
+    """
+    pool = _stability_pool(conn)
+    targets = np.array(thresholds, dtype=float) / 2
+    rng = np.random.default_rng(seed)
+    n_players = len(pool.groups)
+    n_columns = len(pool.column_index)
+    minutes_column = pool.column_index["minutes"]
+    actual_minutes = np.empty((n_draws, len(thresholds), n_players, 2))
+
+    records = []
+    for draw in range(n_draws):
+        totals = np.empty((2, len(thresholds), n_players, n_columns))
+        for half, players in enumerate((pool.first, pool.second)):
+            for player, matches in enumerate(players):
+                running = matches[rng.permutation(len(matches))].cumsum(axis=0)
+                reached = np.searchsorted(running[:, minutes_column], targets)
+                totals[half, :, player] = running[np.minimum(reached, len(running) - 1)]
+        actual_minutes[draw] = np.moveaxis(totals[:, :, :, minutes_column], 0, -1)
+
+        for position, threshold in enumerate(thresholds):
+            first = _sample_rates(totals[0, position], pool.column_index)
+            second = _sample_rates(totals[1, position], pool.column_index)
+            r_split = _weighted_split_correlations(first, second, pool.groups)
+            r_full = _spearman_brown(r_split)
+            records.extend(
+                (draw, threshold, metric.name, n_players, r_split[index], r_full[index])
+                for index, metric in enumerate(METRICS)
+            )
+    columns = ["draw", "threshold", "metric", "n_players", "r_split", "r_full"]
+    return pd.DataFrame(records, columns=columns), actual_minutes
+
+
+def _metric_summary(draws: pd.DataFrame) -> pd.DataFrame:
+    """Return each metric's average r_split and r_full and r_full's 10th and 90th percentiles."""
+    grouped = draws.groupby(["threshold", "metric"], sort=False)
+    summary = grouped.agg(
+        n_players=("n_players", "first"),
+        r_split=("r_split", "mean"),
+        r_full=("r_full", "mean"),
+        r_full_p10=("r_full", lambda values: values.quantile(0.1)),
+        r_full_p90=("r_full", lambda values: values.quantile(0.9)),
+    )
+    return summary.reset_index()
+
+
+def _mean_summary(draws: pd.DataFrame) -> pd.DataFrame:
+    """Return the all-metrics mean r_full per threshold and its range across draws.
+
+    The range comes from each draw's mean, because averaging the per-metric
+    percentiles would overstate it: metrics do not all move together.
+    """
+    per_draw = draws.groupby(["draw", "threshold"], as_index=False)["r_full"].mean()
+    return (
+        per_draw.groupby("threshold")["r_full"]
+        .agg(
+            mean_r_full="mean",
+            p10=lambda values: values.quantile(0.1),
+            p90=lambda values: values.quantile(0.9),
+        )
+        .reset_index()
+    )
+
+
+def stability_by_threshold(
+    conn: sqlite3.Connection,
+    thresholds: tuple[int, ...] = STABILITY_THRESHOLDS,
+    n_draws: int = STABILITY_DRAWS,
+    seed: int = STABILITY_SEED,
+) -> pd.DataFrame:
+    """Return how reliable every metric is at about T minutes of data.
+
+    A metric only helps a scout if it measures something repeatable about the
+    player. The cap is needed because a minutes threshold alone is only a floor:
+    players above it usually have far more minutes, so an uncapped correlation
+    describes their whole sample rather than T minutes. Here every player in one
+    fixed pool contributes about T/2 minutes per half, in whole matches drawn at
+    random, and the within-group Spearman correlation is repeated over many draws.
+
+    Returns threshold, metric, n_players, r_split (reliability at about T/2),
+    r_full (Spearman-Brown estimate at about T, averaged over draws) and
+    r_full_p10 and r_full_p90 (its 10th and 90th percentiles across draws).
+    """
+    draws, _ = _stability_draws(conn, thresholds, n_draws, seed)
+    return _metric_summary(draws)
+
+
+def stability_mean_range(
+    conn: sqlite3.Connection,
+    thresholds: tuple[int, ...] = STABILITY_THRESHOLDS,
+    n_draws: int = STABILITY_DRAWS,
+    seed: int = STABILITY_SEED,
+) -> pd.DataFrame:
+    """Return the mean r_full across metrics per threshold, with its 10-90% range.
+
+    This single summary is what a minimum-minutes decision rests on. The range
+    shows how much it moves with the random choice of matches.
+    """
+    draws, _ = _stability_draws(conn, thresholds, n_draws, seed)
+    return _mean_summary(draws)
 
 
 def median_minutes_per_half(
-    conn: sqlite3.Connection, thresholds: tuple[int, ...] = DEFAULT_THRESHOLDS
+    conn: sqlite3.Connection,
+    thresholds: tuple[int, ...] = STABILITY_THRESHOLDS,
+    n_draws: int = STABILITY_DRAWS,
+    seed: int = STABILITY_SEED,
 ) -> pd.DataFrame:
-    """Return the median minutes per half among the players in the stability sample.
+    """Return the median minutes actually used per half at each threshold.
 
-    The threshold only sets a floor, so this shows how much data the included
-    players really have. It is the context for reading r_full: when the median
-    is far above T/2, r_full reflects that larger sample rather than T minutes.
+    Whole matches overshoot the T/2 target, so this shows how much data each
+    capped sample really contains, pooled over all players and draws.
     """
-    halves = _half_rates(conn)
+    _, actual = _stability_draws(conn, thresholds, n_draws, seed)
     rows = []
-    for threshold in thresholds:
-        groups, _ = _included_groups(halves, threshold)
-        minutes = pd.concat(groups.values())["minutes"]
+    for position, threshold in enumerate(thresholds):
+        minutes = actual[:, position]
         rows.append(
             {
                 "threshold": threshold,
-                "half_minimum": threshold / 2,
-                "n_players": len(minutes),
-                "median_first_half": minutes[FIRST].median(),
-                "median_second_half": minutes[SECOND].median(),
-                "median_per_half": pd.concat([minutes[FIRST], minutes[SECOND]]).median(),
+                "half_target": threshold / 2,
+                "n_players": minutes.shape[1],
+                "median_first_half": float(np.median(minutes[:, :, 0])),
+                "median_second_half": float(np.median(minutes[:, :, 1])),
+                "median_per_half": float(np.median(minutes)),
             }
         )
     return pd.DataFrame(rows)
@@ -462,16 +602,46 @@ def minutes_histogram_figure(
 
 
 def reliability_figure(
-    conn: sqlite3.Connection, thresholds: tuple[int, ...] = DEFAULT_THRESHOLDS
+    conn: sqlite3.Connection,
+    thresholds: tuple[int, ...] = STABILITY_THRESHOLDS,
+    n_draws: int = STABILITY_DRAWS,
+    seed: int = STABILITY_SEED,
 ) -> go.Figure:
-    """Return r_full against threshold, one faint line per metric and a bold mean.
+    """Return capped r_full against threshold, with faint metrics, a mean and its band.
 
-    It shows whether a higher minimum buys meaningfully better reliability. The
-    metric lines share one quiet color and name themselves on hover, because 16
-    separate hues could not be told apart.
+    It shows whether more minutes buy meaningfully better reliability. The metric
+    lines share one quiet color and name themselves on hover, because 16 separate
+    hues could not be told apart. The band is the 10-90% range of the mean across
+    random draws of matches, so it does not cover uncertainty from having a
+    limited number of players.
     """
-    stability = stability_by_threshold(conn, thresholds)
+    draws, _ = _stability_draws(conn, thresholds, n_draws, seed)
+    stability = _metric_summary(draws)
+    mean = _mean_summary(draws)
+
     figure = go.Figure()
+    figure.add_trace(
+        go.Scatter(
+            x=mean["threshold"],
+            y=mean["p90"],
+            mode="lines",
+            line={"width": 0},
+            showlegend=False,
+            hoverinfo="skip",
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=mean["threshold"],
+            y=mean["p10"],
+            mode="lines",
+            line={"width": 0},
+            fill="tonexty",
+            fillcolor=BAND_FILL,
+            name="10-90% of draws (mean)",
+            hoverinfo="skip",
+        )
+    )
     for index, (metric, rows) in enumerate(stability.groupby("metric", sort=False)):
         figure.add_trace(
             go.Scatter(
@@ -485,22 +655,24 @@ def reliability_figure(
                 hovertemplate=f"{metric}<br>T = %{{x}}<br>r_full = %{{y:.2f}}<extra></extra>",
             )
         )
-
-    mean = stability.groupby("threshold", as_index=False)["r_full"].mean()
     figure.add_trace(
         go.Scatter(
             x=mean["threshold"],
-            y=mean["r_full"],
+            y=mean["mean_r_full"],
             mode="lines+markers",
             name="Mean of all metrics",
             line={"color": SERIES_COLORS[0], "width": 3},
             marker={"color": SERIES_COLORS[0], "size": 9, "line": {"color": SURFACE, "width": 2}},
-            hovertemplate="Mean<br>T = %{x}<br>r_full = %{y:.2f}<extra></extra>",
+            customdata=mean[["p10", "p90"]],
+            hovertemplate=(
+                "Mean<br>T = %{x}<br>r_full = %{y:.2f}"
+                "<br>10-90%: %{customdata[0]:.2f} to %{customdata[1]:.2f}<extra></extra>"
+            ),
         )
     )
     figure.add_annotation(
         x=mean["threshold"].iloc[-1],
-        y=mean["r_full"].iloc[-1],
+        y=mean["mean_r_full"].iloc[-1],
         text="Mean",
         showarrow=False,
         xanchor="left",
@@ -509,7 +681,10 @@ def reliability_figure(
     )
     figure.update_layout(
         **_chart_layout(
-            "Reliability by minutes threshold", "Minutes threshold (T)", "Reliability (r_full)", True
+            "Reliability at about T minutes of data",
+            "Minutes of data (T)",
+            "Reliability (r_full)",
+            True,
         )
     )
     figure.update_xaxes(tickvals=list(thresholds))
