@@ -105,6 +105,26 @@ def merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
     return merged
 
 
+def played_stints(
+    squad_row, lengths: dict[int, int], subbed_off_times: dict[tuple[int, int], int]
+) -> tuple[list[tuple[int, int, str]], int | None]:
+    """Return a player's corrected (start, end, position) stints and sending-off time.
+
+    Each stint is cut at the player's sending-off or substitution, and stints
+    left with no length are dropped.
+    """
+    stints = [
+        (*stint_interval(stint, lengths), stint["position"]) for stint in squad_row.positions
+    ]
+    sent_off_at = sending_off_time(squad_row.cards, lengths)
+    subbed_off_at = subbed_off_times.get((int(squad_row.match_id), int(squad_row.player_id)))
+    exits = [t for t in (sent_off_at, subbed_off_at) if t is not None]
+    if exits:
+        left_at = min(exits)
+        stints = [(s, min(e, left_at), p) for s, e, p in stints if s < left_at]
+    return [(s, e, p) for s, e, p in stints if e > s], sent_off_at
+
+
 def compute_minutes(lineups: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
     """Return one row per player who was on the pitch in a match."""
     lengths_by_match = period_lengths(events)
@@ -116,14 +136,8 @@ def compute_minutes(lineups: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame
         lengths = lengths_by_match[int(squad_row.match_id)]
         match_end = sum(lengths.values())
 
-        intervals = [stint_interval(stint, lengths) for stint in squad_row.positions]
-        sent_off_at = sending_off_time(squad_row.cards, lengths)
-        subbed_off_at = subbed_off_times.get((int(squad_row.match_id), int(squad_row.player_id)))
-        exits = [t for t in (sent_off_at, subbed_off_at) if t is not None]
-        if exits:
-            left_at = min(exits)
-            intervals = [(s, min(e, left_at)) for s, e in intervals if s < left_at]
-        intervals = merge_intervals([(s, e) for s, e in intervals if e > s])
+        stints, sent_off_at = played_stints(squad_row, lengths, subbed_off_times)
+        intervals = merge_intervals([(start, end) for start, end, _ in stints])
         seconds = sum(end - start for start, end in intervals)
         if seconds == 0:
             continue
