@@ -1,6 +1,6 @@
-"""Step 4: build the SQLite scouting database from the raw Parquet files.
+"""Build the SQLite scouting database from the raw Parquet files.
 
-Rebuilds data/scouting.db from scratch each time it runs.
+Rebuilds data/scouting.db from scratch each time it runs, then validates it.
 Run from the project root with: python scripts/build_db.py
 """
 
@@ -14,22 +14,76 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data_loader import EVENTS_PATH, LINEUPS_PATH, MATCHES_PATH  # noqa: E402
+from src.metrics import EVENT_COLUMNS, EVENT_TYPES, METRICS, build_player_match  # noqa: E402
 from src.minutes import compute_minutes  # noqa: E402
+from src.positions import position_minutes, primary_positions  # noqa: E402
+from src.validation import run_validation  # noqa: E402
 
 DB_PATH = PROJECT_ROOT / "data" / "scouting.db"
 MIN_SEASON_MINUTES = 600
 
-SCHEMA = f"""
+
+def player_match_columns_sql() -> str:
+    """Return the metric column definitions for the player_match table."""
+    columns = [
+        f"    {m.name} {m.column_type}" + ("" if m.name == "pass_completion_pct" else " NOT NULL")
+        for m in METRICS
+    ]
+    columns.append("    passes_attempted INTEGER NOT NULL")
+    return ",\n".join(columns)
+
+
+def season_columns_sql() -> str:
+    """Return the season total and rate columns for player_season_p90."""
+    lines = []
+    for metric in METRICS:
+        if metric.per_90:
+            lines.append(f"    SUM(pm.{metric.name}) AS {metric.name}")
+            lines.append(f"    SUM(pm.{metric.name}) * 90.0 / SUM(pm.minutes) AS {metric.season_column}")
+        else:
+            # A percentage of the season's passes, not an average of match percentages.
+            lines.append(
+                "    SUM(pm.passes_completed) * 100.0 / NULLIF(SUM(pm.passes_attempted), 0)"
+                f" AS {metric.season_column}"
+            )
+    return ",\n".join(lines)
+
+
+def percentile_columns_sql() -> str:
+    """Return one PERCENT_RANK column per metric for player_percentiles."""
+    lines = []
+    for metric in METRICS:
+        direction = "ASC" if metric.higher_is_better else "DESC"
+        lines.append(
+            f"    PERCENT_RANK() OVER (PARTITION BY position_group "
+            f"ORDER BY {metric.season_column} {direction}) AS {metric.season_column}_pctl"
+        )
+    return ",\n".join(lines)
+
+
+def schema_sql() -> str:
+    """Return the full database schema."""
+    return f"""
 CREATE TABLE players (
-    player_id       INTEGER PRIMARY KEY,
-    player_name     TEXT NOT NULL,
-    player_nickname TEXT,
-    country         TEXT
+    player_id        INTEGER PRIMARY KEY,
+    player_name      TEXT NOT NULL,
+    player_nickname  TEXT,
+    country          TEXT,
+    primary_position TEXT,
+    position_group   TEXT
 );
 
 CREATE TABLE teams (
     team_id   INTEGER PRIMARY KEY,
     team_name TEXT NOT NULL
+);
+
+CREATE TABLE player_positions (
+    player_id        INTEGER NOT NULL REFERENCES players (player_id),
+    team_id          INTEGER NOT NULL REFERENCES teams (team_id),
+    primary_position TEXT NOT NULL,
+    position_group   TEXT NOT NULL,
+    PRIMARY KEY (player_id, team_id)
 );
 
 CREATE TABLE matches (
@@ -48,30 +102,41 @@ CREATE TABLE player_match (
     match_id  INTEGER NOT NULL REFERENCES matches (match_id),
     team_id   INTEGER NOT NULL REFERENCES teams (team_id),
     minutes   REAL NOT NULL,
-    shots     INTEGER NOT NULL,
-    xg        REAL NOT NULL,
-    pressures INTEGER NOT NULL,
+{player_match_columns_sql()},
     PRIMARY KEY (player_id, match_id)
+);
+
+CREATE TABLE metric_definitions (
+    metric_name      TEXT PRIMARY KEY,
+    definition       TEXT NOT NULL,
+    higher_is_better INTEGER NOT NULL
 );
 
 CREATE VIEW player_season_p90 AS
 SELECT
     p.player_id,
     p.player_name,
+    p.position_group,
     GROUP_CONCAT(DISTINCT t.team_name) AS teams,
     COUNT(*) AS matches,
     SUM(pm.minutes) AS minutes,
-    SUM(pm.shots) AS shots,
-    SUM(pm.xg) AS xg,
-    SUM(pm.pressures) AS pressures,
-    SUM(pm.shots) * 90.0 / SUM(pm.minutes) AS shots_p90,
-    SUM(pm.xg) * 90.0 / SUM(pm.minutes) AS xg_p90,
-    SUM(pm.pressures) * 90.0 / SUM(pm.minutes) AS pressures_p90
+{season_columns_sql()}
 FROM player_match AS pm
 JOIN players AS p ON p.player_id = pm.player_id
 JOIN teams AS t ON t.team_id = pm.team_id
-GROUP BY p.player_id, p.player_name
+WHERE p.position_group IS NOT NULL
+GROUP BY p.player_id, p.player_name, p.position_group
 HAVING SUM(pm.minutes) >= {MIN_SEASON_MINUTES};
+
+CREATE VIEW player_percentiles AS
+SELECT
+    player_id,
+    player_name,
+    position_group,
+    teams,
+    minutes,
+{percentile_columns_sql()}
+FROM player_season_p90;
 """
 
 
@@ -82,10 +147,25 @@ def build_teams(matches: pd.DataFrame) -> pd.DataFrame:
     return pd.concat([home, away]).drop_duplicates("team_id").sort_values("team_id")
 
 
-def build_players(lineups: pd.DataFrame) -> pd.DataFrame:
-    """Return one row per player named in any squad."""
+def build_players(lineups: pd.DataFrame, by_position: pd.DataFrame) -> pd.DataFrame:
+    """Return one row per squad player, with their season position group.
+
+    Players who never appeared, and goalkeepers, have no position group.
+    """
     columns = ["player_id", "player_name", "player_nickname", "country"]
-    return lineups[columns].drop_duplicates("player_id").sort_values("player_id")
+    players = lineups[columns].drop_duplicates("player_id").sort_values("player_id")
+    return players.merge(
+        primary_positions(by_position, ["player_id"]),
+        on="player_id",
+        how="left",
+        validate="one_to_one",
+    )
+
+
+def build_player_positions(by_position: pd.DataFrame) -> pd.DataFrame:
+    """Return each outfield player's position group at each of their clubs."""
+    positions = primary_positions(by_position, ["player_id", "team_id"])
+    return positions[positions["position_group"].notna()]
 
 
 def build_matches(matches: pd.DataFrame, minutes: pd.DataFrame) -> pd.DataFrame:
@@ -103,26 +183,14 @@ def build_matches(matches: pd.DataFrame, minutes: pd.DataFrame) -> pd.DataFrame:
     return matches[columns].merge(lengths, on="match_id", validate="one_to_one")
 
 
-def build_player_match(minutes: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
-    """Return per-player, per-match minutes with shots, xG and pressures."""
-    is_shot = events["type"] == "Shot"
-    stats = (
-        events.assign(
-            shots=is_shot.astype(int),
-            xg=events["shot_statsbomb_xg"].where(is_shot, 0.0),
-            pressures=(events["type"] == "Pressure").astype(int),
-        )
-        .groupby(["match_id", "player_id"], as_index=False)[["shots", "xg", "pressures"]]
-        .sum()
-    )
-    stats["player_id"] = stats["player_id"].astype(int)
-
-    columns = ["player_id", "match_id", "team_id", "minutes"]
-    player_match = minutes[columns].merge(
-        stats, on=["match_id", "player_id"], how="left", validate="one_to_one"
-    )
-    return player_match.fillna({"shots": 0, "xg": 0.0, "pressures": 0}).astype(
-        {"shots": int, "pressures": int}
+def build_metric_definitions() -> pd.DataFrame:
+    """Return one row per metric, describing how it is calculated."""
+    return pd.DataFrame(
+        {
+            "metric_name": [m.name for m in METRICS],
+            "definition": [m.definition for m in METRICS],
+            "higher_is_better": [int(m.higher_is_better) for m in METRICS],
+        }
     )
 
 
@@ -131,7 +199,7 @@ def write_database(tables: dict[str, pd.DataFrame]) -> None:
     DB_PATH.unlink(missing_ok=True)
     with sqlite3.connect(DB_PATH) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.executescript(SCHEMA)
+        connection.executescript(schema_sql())
         for name, frame in tables.items():
             frame.to_sql(name, connection, if_exists="append", index=False)
     connection.close()
@@ -141,47 +209,43 @@ def main() -> None:
     matches = pd.read_parquet(MATCHES_PATH)
     lineups = pd.read_parquet(LINEUPS_PATH)
     events = pd.read_parquet(
-        EVENTS_PATH,
-        columns=[
-            "match_id",
-            "type",
-            "period",
-            "minute",
-            "second",
-            "player_id",
-            "shot_statsbomb_xg",
-        ],
-        filters=[("type", "in", ["Half End", "Substitution", "Shot", "Pressure"])],
+        EVENTS_PATH, columns=EVENT_COLUMNS, filters=[("type", "in", EVENT_TYPES)]
     )
 
     minutes = compute_minutes(lineups, events)
-    player_match = build_player_match(minutes, events)
+    by_position = position_minutes(lineups, events)
     write_database(
         {
             "teams": build_teams(matches),
-            "players": build_players(lineups),
+            "players": build_players(lineups, by_position),
+            "player_positions": build_player_positions(by_position),
             "matches": build_matches(matches, minutes),
-            "player_match": player_match,
+            "player_match": build_player_match(minutes, events),
+            "metric_definitions": build_metric_definitions(),
         }
     )
 
-    # Every shot and pressure in the raw events should reach player_match.
-    raw_shots = events[events["type"] == "Shot"]
     print(f"Wrote {DB_PATH}")
-    print(f"  Shots: {int(player_match['shots'].sum()):,} in database, {len(raw_shots):,} raw")
-    print(
-        f"  xG: {player_match['xg'].sum():.2f} in database, "
-        f"{raw_shots['shot_statsbomb_xg'].sum():.2f} raw"
-    )
-    print(
-        f"  Pressures: {int(player_match['pressures'].sum()):,} in database, "
-        f"{(events['type'] == 'Pressure').sum():,} raw"
-    )
     with sqlite3.connect(DB_PATH) as connection:
-        for name in ("players", "teams", "matches", "player_match", "player_season_p90"):
+        for name in (
+            "players",
+            "player_positions",
+            "teams",
+            "matches",
+            "player_match",
+            "metric_definitions",
+            "player_season_p90",
+            "player_percentiles",
+        ):
             count = connection.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
             print(f"  {name}: {count:,} rows")
+        print()
+        passed = run_validation(connection, events)
     connection.close()
+
+    if not passed:
+        sys.exit("Validation failed: see the MISMATCH or non-zero lines above.")
+    print("\nAll automated checks passed.")
 
 
 if __name__ == "__main__":
