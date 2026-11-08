@@ -21,6 +21,22 @@ STABILITY_DRAWS = 200
 STABILITY_SEED = 42
 POOL_HALF_MINUTES = 600
 RATE_DECIMALS = 9
+HIGH_RELIABILITY = 0.70
+MODERATE_RELIABILITY = 0.55
+RELIABILITY_NOTES = {
+    "high": (
+        "Stable: players tend to keep their rank on this metric from one sample of matches "
+        "to another, so differences between players are meaningful."
+    ),
+    "moderate": (
+        "Fairly stable: useful evidence, but small differences between players may be noise, "
+        "so read it alongside other metrics."
+    ),
+    "low": (
+        "Unstable at this sample size: a player's rank can change a lot depending on which "
+        "matches are sampled, so treat it as a weak signal and do not rely on it alone."
+    ),
+}
 MIN_GROUP_PLAYERS = 8
 FIRST = "first"
 SECOND = "second"
@@ -530,6 +546,46 @@ def median_minutes_per_half(
             }
         )
     return pd.DataFrame(rows)
+
+
+def _reliability_tier(r_full: float) -> str:
+    """Return the reliability tier for an r_full value."""
+    if r_full >= HIGH_RELIABILITY:
+        return "high"
+    if r_full >= MODERATE_RELIABILITY:
+        return "moderate"
+    return "low"
+
+
+def metric_reliability(conn: sqlite3.Connection, threshold: int = 600) -> pd.DataFrame:
+    """Return each metric's reliability at a minutes threshold, with a tier and note.
+
+    The minimum-minutes rule is a trade-off, so readers need to know which
+    metrics can be trusted at that sample size. Returns metric, r_full, p10, p90,
+    tier and note. Tiers come from the computed r_full, so they follow the data.
+    The threshold cannot exceed what the fixed pool guarantees in each half.
+    """
+    if not 0 < threshold <= 2 * POOL_HALF_MINUTES:
+        raise ValueError(f"threshold must be above 0 and at most {2 * POOL_HALF_MINUTES}")
+    stability = stability_by_threshold(conn, thresholds=(threshold,))
+    reliability = stability.rename(columns={"r_full_p10": "p10", "r_full_p90": "p90"})[
+        ["metric", "r_full", "p10", "p90"]
+    ]
+    reliability["tier"] = reliability["r_full"].map(_reliability_tier)
+    reliability["note"] = reliability["tier"].map(RELIABILITY_NOTES)
+    return reliability
+
+
+def reliability_at_minutes(conn: sqlite3.Connection, minutes: float) -> pd.DataFrame:
+    """Return the mean r_full across metrics for a given number of minutes.
+
+    The app's minutes slider needs a value between the computed thresholds. This
+    interpolates linearly between them and holds the end values outside their
+    range. Returns one row with minutes and mean_r_full.
+    """
+    means = stability_mean_range(conn)
+    mean_r_full = float(np.interp(minutes, means["threshold"], means["mean_r_full"]))
+    return pd.DataFrame([{"minutes": minutes, "mean_r_full": mean_r_full}])
 
 
 def _chart_layout(title: str, x_title: str, y_title: str, show_legend: bool) -> dict:

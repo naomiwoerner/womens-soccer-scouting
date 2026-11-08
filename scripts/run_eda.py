@@ -18,6 +18,7 @@ from src import eda  # noqa: E402
 from src.metrics import METRICS  # noqa: E402
 
 DB_PATH = PROJECT_ROOT / "data" / "scouting.db"
+SLIDER_EXAMPLES = (300, 600, 900, 1200)
 
 
 def stability_pivot(stability: pd.DataFrame) -> pd.DataFrame:
@@ -79,6 +80,12 @@ def main() -> None:
         print_section("10-90% of draws, per metric", stability_range_pivot(stability), index=True)
         print_section("Mean across metrics, 10-90% of draws", eda.stability_mean_range(connection).round(3))
         print_section("Median actual minutes per half", eda.median_minutes_per_half(connection).round(1))
+        print_section("Metric reliability at 600 minutes", eda.metric_reliability(connection).round(3))
+        by_minutes = pd.concat(
+            [eda.reliability_at_minutes(connection, minutes) for minutes in SLIDER_EXAMPLES],
+            ignore_index=True,
+        )
+        print_section("Reliability at minutes", by_minutes.round(3))
         if arguments.figures_dir:
             save_figures(connection, arguments.figures_dir)
             print(f"\nSaved figures to {arguments.figures_dir}")
