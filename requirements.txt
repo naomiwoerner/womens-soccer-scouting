@@ -1,3 +1,4 @@
 statsbombpy
 pandas
 pyarrow
+plotly
