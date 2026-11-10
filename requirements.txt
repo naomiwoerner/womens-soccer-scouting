@@ -2,3 +2,4 @@ statsbombpy
 pandas
 pyarrow
 plotly
+anthropic
