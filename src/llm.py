@@ -1,8 +1,11 @@
-"""Minimal client for one-shot calls to Claude.
+"""Minimal client for one-shot calls to a language model.
 
-The API key is read from the ANTHROPIC_API_KEY environment variable, or else
-from .streamlit/secrets.toml. Every failure becomes an LLMError with a message
-a user can read. The key is never printed, logged or included in an error.
+Two providers are supported: Google Gemini and Anthropic. LLM_PROVIDER picks
+one ("gemini" or "anthropic", default "gemini"), and each provider has its own
+key, GEMINI_API_KEY or ANTHROPIC_API_KEY. Every setting is read from the
+environment first, then from .streamlit/secrets.toml. Every failure becomes an
+LLMError with a message a user can read. Keys are never printed, logged or
+included in an error.
 """
 
 import os
@@ -10,51 +13,113 @@ import tomllib
 from pathlib import Path
 
 import anthropic
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types as genai_types
 
-MODEL = "claude-haiku-5-5"
+try:
+    import httpx2
+except ImportError:  # pragma: no cover - google-genai and anthropic depend on it
+    httpx2 = None
+try:
+    import httpx
+except ImportError:
+    httpx = None
+
+ANTHROPIC_MODEL = "claude-haiku-5-5"
+# Google's current stable Flash model, free of charge on the Gemini free tier.
+GEMINI_MODEL = "gemini-3.8-flash"
+MODELS = {"gemini": GEMINI_MODEL, "anthropic": ANTHROPIC_MODEL}
+PROVIDERS = tuple(MODELS)
+PROVIDER_LABELS = {"gemini": "Gemini", "anthropic": "Anthropic"}
+DEFAULT_PROVIDER = "gemini"
+PROVIDER_SETTING = "LLM_PROVIDER"
+KEY_NAMES = {"gemini": "GEMINI_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}
+PLACEHOLDER_KEYS = ("your-key-here", "your-gemini-key-here", "your-anthropic-key-here")
+
 TIMEOUT_SECONDS = 30.0
 DEFAULT_MAX_TOKENS = 4096
-# Haiku 5.5 rejects sampling settings such as temperature, so effort is the
-# setting used here; low suits short extraction tasks.
-EFFORT = "low"
-KEY_NAME = "ANTHROPIC_API_KEY"
-PLACEHOLDER_KEY = "your-key-here"
+# Neither model is given a temperature: Haiku 5.5 rejects sampling settings,
+# so both use a low reasoning setting instead, which suits short extraction.
+ANTHROPIC_EFFORT = "low"
+GEMINI_THINKING_LEVEL = genai_types.ThinkingLevel.LOW
 SECRETS_PATH = Path(__file__).resolve().parents[1] / ".streamlit" / "secrets.toml"
+
+_HTTP_TIMEOUTS = tuple(lib.TimeoutException for lib in (httpx2, httpx) if lib is not None)
+_HTTP_ERRORS = tuple(lib.HTTPError for lib in (httpx2, httpx) if lib is not None)
+_FINISHED = (None, genai_types.FinishReason.STOP, genai_types.FinishReason.FINISH_REASON_UNSPECIFIED)
+_BLOCKED = (
+    genai_types.FinishReason.SAFETY,
+    genai_types.FinishReason.RECITATION,
+    genai_types.FinishReason.BLOCKLIST,
+    genai_types.FinishReason.PROHIBITED_CONTENT,
+    genai_types.FinishReason.SPII,
+)
 
 
 class LLMError(RuntimeError):
-    """Raised when Claude cannot be reached or gives no usable reply."""
+    """Raised when the model cannot be reached or gives no usable reply."""
 
 
-def _usable(key) -> str | None:
-    """Return the key if it is a real value, or None for blanks and the placeholder."""
-    if not isinstance(key, str):
-        return None
-    key = key.strip()
-    return key if key and key != PLACEHOLDER_KEY else None
+def _read_secrets() -> dict:
+    """Return the contents of secrets.toml, or {} if the file does not exist.
 
-
-def get_api_key() -> str | None:
-    """Return the API key from the environment, then secrets.toml, or None.
-
-    Raises LLMError if secrets.toml exists but cannot be read as TOML. The
-    error message never contains the file's contents.
+    Raises LLMError if the file cannot be read as TOML. The error message
+    never contains the file's contents.
     """
-    from_environment = _usable(os.environ.get(KEY_NAME))
-    if from_environment:
-        return from_environment
     if not SECRETS_PATH.exists():
-        return None
+        return {}
     try:
         with SECRETS_PATH.open("rb") as secrets_file:
-            secrets = tomllib.load(secrets_file)
+            return tomllib.load(secrets_file)
     except (OSError, tomllib.TOMLDecodeError):
         raise LLMError(f"Could not read {SECRETS_PATH.name}: check that it is valid TOML.") from None
-    return _usable(secrets.get(KEY_NAME))
+
+
+def _setting(name: str) -> str | None:
+    """Return a non-blank string setting from the environment, then secrets.toml."""
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        value = _read_secrets().get(name)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()
+
+
+def get_provider() -> str:
+    """Return the configured provider, "gemini" or "anthropic".
+
+    Defaults to "gemini" when LLM_PROVIDER is not set. Raises LLMError for any
+    other value; the value itself is not repeated, in case it is a key.
+    """
+    provider = _setting(PROVIDER_SETTING)
+    if provider is None:
+        return DEFAULT_PROVIDER
+    provider = provider.lower()
+    if provider not in PROVIDERS:
+        raise LLMError(f"{PROVIDER_SETTING} must be one of: {', '.join(PROVIDERS)}.")
+    return provider
+
+
+def active_model() -> tuple[str, str]:
+    """Return (provider, model) for the configured provider."""
+    provider = get_provider()
+    return provider, MODELS[provider]
+
+
+def get_api_key(provider: str | None = None) -> str | None:
+    """Return the API key for a provider (default: the configured one), or None.
+
+    Blank values and the placeholders from secrets.toml.example count as
+    missing. Raises LLMError if secrets.toml is not valid TOML.
+    """
+    provider = get_provider() if provider is None else provider
+    key = _setting(KEY_NAMES[provider])
+    return None if key is None or key in PLACEHOLDER_KEYS else key
 
 
 def has_api_key() -> bool:
-    """Return True if an API key is configured."""
+    """Return True if the configured provider has an API key."""
     try:
         return get_api_key() is not None
     except LLMError:
@@ -62,36 +127,50 @@ def has_api_key() -> bool:
 
 
 def call_llm(system: str, user: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> str:
-    """Send one system prompt and user message to Claude and return the reply text.
+    """Send one system prompt and user message to the model and return the reply text.
 
-    Uses MODEL with a TIMEOUT_SECONDS timeout and no automatic retries, so a
-    caller waits at most about that long. Raises LLMError if there is no key,
-    the request fails, the model declines, or the reply is empty or cut off.
+    Uses the configured provider's model with a TIMEOUT_SECONDS timeout and no
+    automatic retries, so a caller waits at most about that long. Raises
+    LLMError if there is no key, the request fails, the model declines or the
+    reply is empty or cut off.
     """
-    api_key = get_api_key()
+    provider = get_provider()
+    api_key = get_api_key(provider)
     if api_key is None:
         raise LLMError(
-            f"No Anthropic API key found. Set {KEY_NAME} or add it to .streamlit/secrets.toml."
+            f"No {PROVIDER_LABELS[provider]} API key found. Set {KEY_NAMES[provider]} "
+            "or add it to .streamlit/secrets.toml."
         )
+    if provider == "gemini":
+        return _call_gemini(api_key, system, user, max_tokens)
+    return _call_anthropic(api_key, system, user, max_tokens)
+
+
+def _timeout_error() -> LLMError:
+    return LLMError(f"The model did not respond within {TIMEOUT_SECONDS:g} seconds.")
+
+
+def _call_anthropic(api_key: str, system: str, user: str, max_tokens: int) -> str:
+    """Return the reply text from one Anthropic Messages API call."""
     client = anthropic.Anthropic(api_key=api_key, timeout=TIMEOUT_SECONDS, max_retries=0)
     try:
         response = client.messages.create(
-            model=MODEL,
+            model=ANTHROPIC_MODEL,
             max_tokens=max_tokens,
             system=system,
             messages=[{"role": "user", "content": user}],
-            output_config={"effort": EFFORT},
+            output_config={"effort": ANTHROPIC_EFFORT},
         )
     except anthropic.AuthenticationError:
         raise LLMError("The Anthropic API key was rejected. Check that it is correct.") from None
     except anthropic.PermissionDeniedError:
         raise LLMError("The Anthropic API key does not have access to this model.") from None
     except anthropic.NotFoundError:
-        raise LLMError(f"The model {MODEL} was not found.") from None
+        raise LLMError(f"The model {ANTHROPIC_MODEL} was not found.") from None
     except anthropic.RateLimitError:
         raise LLMError("The Anthropic API rate limit was reached. Try again shortly.") from None
     except anthropic.APITimeoutError:
-        raise LLMError(f"Claude did not respond within {TIMEOUT_SECONDS:g} seconds.") from None
+        raise _timeout_error() from None
     except anthropic.APIConnectionError:
         raise LLMError("Could not connect to the Anthropic API. Check the internet connection.") from None
     except anthropic.APIStatusError as error:
@@ -100,10 +179,75 @@ def call_llm(system: str, user: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> st
         raise LLMError("The request to the Anthropic API failed.") from None
 
     if response.stop_reason == "refusal":
-        raise LLMError("Claude declined this request.")
+        raise LLMError("The model declined this request.")
     if response.stop_reason == "max_tokens":
-        raise LLMError("Claude's reply was cut off before it finished.")
+        raise LLMError("The model's reply was cut off before it finished.")
     text = "".join(block.text for block in response.content if block.type == "text").strip()
     if not text:
-        raise LLMError("Claude returned an empty reply.")
+        raise LLMError("The model returned an empty reply.")
+    return text
+
+
+def _gemini_status_error(error: genai_errors.APIError) -> LLMError:
+    """Return a readable LLMError for a Gemini HTTP error status."""
+    code = error.code
+    # A bad key comes back as 400 INVALID_ARGUMENT with reason API_KEY_INVALID.
+    if code == 401 or (code == 400 and "API_KEY_INVALID" in str(error.details)):
+        return LLMError("The Gemini API key was rejected. Check that it is correct.")
+    if code == 403:
+        return LLMError("The Gemini API key does not have access to this model.")
+    if code == 404:
+        return LLMError(f"The model {GEMINI_MODEL} was not found.")
+    if code == 429:
+        return LLMError("The Gemini API rate limit or free-tier quota was reached. Try again shortly.")
+    if code in (408, 504):
+        return _timeout_error()
+    return LLMError(f"The Gemini API returned an error (status {code}).")
+
+
+def _call_gemini(api_key: str, system: str, user: str, max_tokens: int) -> str:
+    """Return the reply text from one Gemini generate_content call."""
+    try:
+        client = genai.Client(
+            api_key=api_key,
+            http_options=genai_types.HttpOptions(
+                timeout=int(TIMEOUT_SECONDS * 1000),  # milliseconds
+                retry_options=genai_types.HttpRetryOptions(attempts=1),
+            ),
+        )
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=user,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=system,
+                max_output_tokens=max_tokens,
+                thinking_config=genai_types.ThinkingConfig(thinking_level=GEMINI_THINKING_LEVEL),
+            ),
+        )
+    except genai_errors.APIError as error:
+        raise _gemini_status_error(error) from None
+    except _HTTP_TIMEOUTS:
+        raise _timeout_error() from None
+    except _HTTP_ERRORS:
+        raise LLMError("Could not connect to the Gemini API. Check the internet connection.") from None
+    except Exception:  # anything else from the SDK, e.g. a reply it cannot parse
+        raise LLMError("The request to the Gemini API failed.") from None
+
+    feedback = response.prompt_feedback
+    if feedback is not None and feedback.block_reason:
+        raise LLMError("The model declined this request.")
+    if not response.candidates:
+        raise LLMError("The model returned an empty reply.")
+    candidate = response.candidates[0]
+    finish = candidate.finish_reason
+    if finish == genai_types.FinishReason.MAX_TOKENS:
+        raise LLMError("The model's reply was cut off before it finished.")
+    if finish in _BLOCKED:
+        raise LLMError("The model declined this request.")
+    if finish not in _FINISHED:
+        raise LLMError(f"The model stopped before finishing ({getattr(finish, 'value', finish)}).")
+    parts = candidate.content.parts if candidate.content and candidate.content.parts else []
+    text = "".join(part.text for part in parts if part.text and not part.thought).strip()
+    if not text:
+        raise LLMError("The model returned an empty reply.")
     return text
