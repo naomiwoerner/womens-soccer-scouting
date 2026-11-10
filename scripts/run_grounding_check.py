@@ -4,21 +4,29 @@
    requirement for her group) must come out "verified".
 2. Simulated bad reports, each made by changing one thing in Fenna Kalma's
    offline report for a pressing number 9, must be caught by the right rule.
+3. generate_report with simulated model replies: a grounded draft is kept,
+   a failed draft is regenerated once with the problems fed back, a second
+   failure falls back to the offline template, and the first draft's check
+   is always kept as first_grounding.
 
 Run from the project root with: python scripts/run_grounding_check.py
 """
 
 import copy
+import json
 import sqlite3
 import sys
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src import fit  # noqa: E402
+from src import report as report_module  # noqa: E402
+from src.llm import LLMError  # noqa: E402
 from src.grounding import check_grounding  # noqa: E402
 from src.report import build_fact_sheet, offline_report  # noqa: E402
 
@@ -213,10 +221,97 @@ def check_bad_reports(conn: sqlite3.Connection) -> None:
     )
 
 
+def check_regeneration(conn: sqlite3.Connection) -> None:
+    print("3. Fact check inside generate_report (simulated replies)")
+    result = fit.fit_scores(conn, {"position_group": "Striker", "weights": STRIKER}, top_n=500)
+    player_id = int(result.table.loc[result.table["player"] == "Fenna Kalma", "player_id"].iloc[0])
+    good = kalma_report(conn)
+    grounded = json.dumps(good.sections)
+    wrong = json.dumps(replaced(good, "strengths", "4.33 per 90", "4.38 per 90").sections)
+    ordinal = json.dumps(replaced(good, "summary", "She ranks 1 of 23", "She ranks 1st of 23").sections)
+
+    def run(replies):
+        with (
+            mock.patch.object(report_module, "call_llm", side_effect=replies) as call,
+            mock.patch.object(report_module, "active_model", return_value=("gemini", "gemini-test")),
+        ):
+            produced = report_module.generate_report(conn, REQUEST_TEXT, result, player_id)
+        return produced, call
+
+    def status(grounding):
+        return None if grounding is None else grounding.status
+
+    produced, call = run([grounded])
+    check(
+        "grounded first draft is kept",
+        (produced.source, call.call_count, status(produced.first_grounding), status(produced.grounding))
+        == ("llm", 1, "verified", "verified"),
+    )
+    produced, call = run([ordinal])
+    check(
+        "warnings only: kept without regenerating",
+        (produced.source, call.call_count, status(produced.first_grounding), status(produced.grounding))
+        == ("llm", 1, "warnings", "warnings"),
+    )
+    produced, call = run([wrong, grounded])
+    feedback = call.call_args_list[1].args[1]
+    check(
+        "failed, then grounded: regenerated once",
+        (produced.source, call.call_count, status(produced.first_grounding), status(produced.grounding))
+        == ("llm", 2, "failed", "verified")
+        and produced.sections == good.sections
+        and produced.notes[0].startswith("The first draft failed the fact check (1 problem(s))"),
+        produced.notes[0],
+    )
+    check(
+        "the regeneration request feeds back the problem and the draft",
+        "failed the fact check" in feedback
+        and 'The number "4.38" in strengths is not in the fact sheet.' in feedback
+        and "4.38 per 90" in feedback
+        and REQUEST_TEXT in feedback,
+    )
+    produced, call = run([wrong, wrong])
+    check(
+        "failed twice: offline template, first check kept",
+        (produced.source, call.call_count, status(produced.first_grounding), status(produced.grounding))
+        == ("offline", 2, "failed", "verified")
+        and produced.provider is None
+        and produced.notes[0].startswith(
+            "Used the offline report template. Reason: The model's report failed the fact check twice"
+        ),
+        produced.notes[0],
+    )
+    produced, call = run([wrong, LLMError("The model did not respond within 30 seconds.")])
+    check(
+        "failed, then model unavailable: offline, first check kept",
+        (produced.source, call.call_count, status(produced.first_grounding)) == ("offline", 2, "failed")
+        and "did not respond" in produced.notes[0],
+    )
+    produced, call = run([wrong, "not json"])
+    check(
+        "failed, then unusable JSON: offline, first check kept",
+        (produced.source, call.call_count, status(produced.first_grounding)) == ("offline", 2, "failed"),
+        produced.notes[0],
+    )
+    produced, call = run(["not json", wrong, grounded])
+    check(
+        "bad JSON, failed draft, then grounded: 3 calls",
+        (produced.source, call.call_count, status(produced.first_grounding), status(produced.grounding))
+        == ("llm", 3, "failed", "verified"),
+    )
+    produced, call = run([LLMError("The model returned an empty reply.")])
+    check(
+        "model unavailable at once: offline, no first check",
+        (produced.source, call.call_count, produced.first_grounding, status(produced.grounding))
+        == ("offline", 1, None, "verified"),
+    )
+
+
 def main() -> None:
     with sqlite3.connect(DB_PATH) as conn:
         check_offline_reports(conn)
         check_bad_reports(conn)
+        check_regeneration(conn)
     conn.close()
     print()
     if failures:

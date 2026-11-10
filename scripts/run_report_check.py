@@ -326,6 +326,11 @@ def check_generator(conn: sqlite3.Connection) -> None:
     requirement = {"position_group": "Striker", "weights": REQUIREMENTS["Striker"], "min_minutes": 600}
     result = fit.fit_scores(conn, requirement, top_n=1)
     player_id = int(result.table["player_id"].iloc[0])
+    # A grounded reply (the offline template's sections), so the fact check passes
+    # and these cases test only the JSON handling. Grounding paths are covered in
+    # run_grounding_check.py.
+    VALID_REPORT.clear()
+    VALID_REPORT.update(offline_report(build_fact_sheet(conn, result, player_id)).sections)
     valid = json.dumps(VALID_REPORT)
     bad_json, missing = "not json", json.dumps({k: v for k, v in VALID_REPORT.items() if k != "caveats"})
     empty_list = json.dumps({**VALID_REPORT, "strengths": []})
@@ -375,7 +380,7 @@ def check_generator(conn: sqlite3.Connection) -> None:
         [empty_list, empty_list],
         "offline",
         2,
-        fallback_note("The model's reply could not be used after one retry"),
+        fallback_note("The model's reply could not be used"),
     )
     expect(
         "model unavailable: offline",

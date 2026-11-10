@@ -40,6 +40,19 @@ def print_report(title: str, report) -> None:
                 print(f"  - {item}")
         else:
             print(f"  {value}")
+    print_grounding("Fact check", report.grounding)
+    if report.first_grounding is not None and report.first_grounding is not report.grounding:
+        print_grounding("First draft's fact check", report.first_grounding)
+
+
+def print_grounding(title: str, grounding) -> None:
+    if grounding is None:
+        return
+    print(f"\n{title}: {grounding.status} ({grounding.numbers_checked} numbers checked)")
+    for problem in grounding.problems:
+        print(f"  problem: {problem}")
+    for warning in grounding.warnings:
+        print(f"  warning: {warning}")
 
 
 def main() -> None:
