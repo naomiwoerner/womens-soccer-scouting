@@ -2,13 +2,15 @@
 
 Two providers are supported: Google Gemini and Anthropic. LLM_PROVIDER picks
 one ("gemini" or "anthropic", default "gemini"), and each provider has its own
-key, GEMINI_API_KEY or ANTHROPIC_API_KEY. Every setting is read from the
+key, GEMINI_API_KEY or ANTHROPIC_API_KEY, and GEMINI_MODEL optionally
+overrides the default Gemini model. Every setting is read from the
 environment first, then from .streamlit/secrets.toml. Every failure becomes an
 LLMError with a message a user can read. Keys are never printed, logged or
 included in an error.
 """
 
 import os
+import time
 import tomllib
 from pathlib import Path
 
@@ -27,8 +29,10 @@ except ImportError:
     httpx = None
 
 ANTHROPIC_MODEL = "claude-haiku-5-5"
-# Google's current stable Flash model, free of charge on the Gemini free tier.
+# Default Gemini model: Google's current stable Flash model, free of charge on
+# the Gemini free tier. The GEMINI_MODEL setting overrides it.
 GEMINI_MODEL = "gemini-3.8-flash"
+GEMINI_MODEL_SETTING = "GEMINI_MODEL"
 MODELS = {"gemini": GEMINI_MODEL, "anthropic": ANTHROPIC_MODEL}
 PROVIDERS = tuple(MODELS)
 PROVIDER_LABELS = {"gemini": "Gemini", "anthropic": "Anthropic"}
@@ -37,7 +41,10 @@ PROVIDER_SETTING = "LLM_PROVIDER"
 KEY_NAMES = {"gemini": "GEMINI_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}
 PLACEHOLDER_KEYS = ("your-key-here", "your-gemini-key-here", "your-anthropic-key-here")
 
-TIMEOUT_SECONDS = 30.0
+TIMEOUT_SECONDS = 30.0  # per attempt
+# Gemini's 503 (model overloaded) is usually brief, so it alone is retried once.
+GEMINI_RETRY_STATUS = 503
+GEMINI_RETRY_DELAY_SECONDS = 2.0
 DEFAULT_MAX_TOKENS = 4096
 # Neither model is given a temperature: Haiku 5.5 rejects sampling settings,
 # so both use a low reasoning setting instead, which suits short extraction.
@@ -101,10 +108,17 @@ def get_provider() -> str:
     return provider
 
 
+def get_model(provider: str) -> str:
+    """Return the model for a provider; for Gemini, the GEMINI_MODEL setting if set."""
+    if provider == "gemini":
+        return _setting(GEMINI_MODEL_SETTING) or GEMINI_MODEL
+    return MODELS[provider]
+
+
 def active_model() -> tuple[str, str]:
     """Return (provider, model) for the configured provider."""
     provider = get_provider()
-    return provider, MODELS[provider]
+    return provider, get_model(provider)
 
 
 def get_api_key(provider: str | None = None) -> str | None:
@@ -129,8 +143,9 @@ def has_api_key() -> bool:
 def call_llm(system: str, user: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> str:
     """Send one system prompt and user message to the model and return the reply text.
 
-    Uses the configured provider's model with a TIMEOUT_SECONDS timeout and no
-    automatic retries, so a caller waits at most about that long. Raises
+    Uses the configured provider's model with a TIMEOUT_SECONDS timeout per
+    attempt. The only retry is one more Gemini attempt after a 503, two
+    seconds later, so a caller waits at most about 62 seconds. Raises
     LLMError if there is no key, the request fails, the model declines or the
     reply is empty or cut off.
     """
@@ -142,7 +157,7 @@ def call_llm(system: str, user: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> st
             "or add it to .streamlit/secrets.toml."
         )
     if provider == "gemini":
-        return _call_gemini(api_key, system, user, max_tokens)
+        return _call_gemini(api_key, get_model("gemini"), system, user, max_tokens)
     return _call_anthropic(api_key, system, user, max_tokens)
 
 
@@ -188,7 +203,7 @@ def _call_anthropic(api_key: str, system: str, user: str, max_tokens: int) -> st
     return text
 
 
-def _gemini_status_error(error: genai_errors.APIError) -> LLMError:
+def _gemini_status_error(error: genai_errors.APIError, model: str) -> LLMError:
     """Return a readable LLMError for a Gemini HTTP error status."""
     code = error.code
     # A bad key comes back as 400 INVALID_ARGUMENT with reason API_KEY_INVALID.
@@ -197,35 +212,52 @@ def _gemini_status_error(error: genai_errors.APIError) -> LLMError:
     if code == 403:
         return LLMError("The Gemini API key does not have access to this model.")
     if code == 404:
-        return LLMError(f"The model {GEMINI_MODEL} was not found.")
+        return LLMError(f"The model {model} was not found.")
     if code == 429:
         return LLMError("The Gemini API rate limit or free-tier quota was reached. Try again shortly.")
+    if code == GEMINI_RETRY_STATUS:
+        return LLMError(
+            f"The model {model} is temporarily unavailable (status 503). Try again later, "
+            f"or set {GEMINI_MODEL_SETTING} to another model."
+        )
     if code in (408, 504):
         return _timeout_error()
     return LLMError(f"The Gemini API returned an error (status {code}).")
 
 
-def _call_gemini(api_key: str, system: str, user: str, max_tokens: int) -> str:
-    """Return the reply text from one Gemini generate_content call."""
+def _generate_with_retry(client, model: str, user: str, config):
+    """Call generate_content, retrying once after a short wait if the reply is 503.
+
+    The SDK's own retries are off, so this is the only retry; every other
+    error, and a second 503, propagates.
+    """
+    try:
+        return client.models.generate_content(model=model, contents=user, config=config)
+    except genai_errors.APIError as error:
+        if error.code != GEMINI_RETRY_STATUS:
+            raise
+    time.sleep(GEMINI_RETRY_DELAY_SECONDS)
+    return client.models.generate_content(model=model, contents=user, config=config)
+
+
+def _call_gemini(api_key: str, model: str, system: str, user: str, max_tokens: int) -> str:
+    """Return the reply text from a Gemini generate_content call (one retry on 503)."""
     try:
         client = genai.Client(
             api_key=api_key,
             http_options=genai_types.HttpOptions(
-                timeout=int(TIMEOUT_SECONDS * 1000),  # milliseconds
+                timeout=int(TIMEOUT_SECONDS * 1000),  # milliseconds, per attempt
                 retry_options=genai_types.HttpRetryOptions(attempts=1),
             ),
         )
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=user,
-            config=genai_types.GenerateContentConfig(
-                system_instruction=system,
-                max_output_tokens=max_tokens,
-                thinking_config=genai_types.ThinkingConfig(thinking_level=GEMINI_THINKING_LEVEL),
-            ),
+        config = genai_types.GenerateContentConfig(
+            system_instruction=system,
+            max_output_tokens=max_tokens,
+            thinking_config=genai_types.ThinkingConfig(thinking_level=GEMINI_THINKING_LEVEL),
         )
+        response = _generate_with_retry(client, model, user, config)
     except genai_errors.APIError as error:
-        raise _gemini_status_error(error) from None
+        raise _gemini_status_error(error, model) from None
     except _HTTP_TIMEOUTS:
         raise _timeout_error() from None
     except _HTTP_ERRORS:
