@@ -57,20 +57,38 @@ def _player_rows(conn: sqlite3.Connection, player_id: int) -> tuple[dict, dict]:
     return season, percentiles
 
 
+def _players_at_lowest(conn: sqlite3.Connection, group: str) -> dict[str, int]:
+    """Return, for each allowed metric, how many players in the group share the lowest value."""
+    counts = ", ".join(
+        f"SUM({SEASON_COLUMNS[metric]}_pctl = 0)" for metric in ALLOWED_METRICS
+    )
+    row = conn.execute(
+        f"SELECT {counts} FROM player_percentiles WHERE position_group = ?", (group,)
+    ).fetchone()
+    return dict(zip(ALLOWED_METRICS, row))
+
+
 def _metric_entry(
-    metric: str, season: dict, percentiles: dict, pool_size: int, group_label: str, tiers: dict
+    metric: str,
+    season: dict,
+    percentiles: dict,
+    pool_size: int,
+    group_label: str,
+    tiers: dict,
+    at_lowest: dict,
 ) -> dict:
     """Return the display fields for one metric of one player."""
     column = SEASON_COLUMNS[metric]
     percentile = percentiles[f"{column}_pctl"]
     value, unit = _format_value(metric, season[column])
+    tied = percentile == 0 and at_lowest[metric] > 1
     return {
         "metric": metric,
         "name": METRIC_NAMES[metric],
         "value": value,
         "unit": unit,
         "percentile": f"{round(percentile * 100)}",
-        "rank": rank_phrase(percentile, pool_size, group_label),
+        "rank": rank_phrase(percentile, pool_size, group_label, tied_for_lowest=tied),
         "reliability": tiers[metric],
     }
 
@@ -140,9 +158,10 @@ def build_fact_sheet(conn: sqlite3.Connection, fit_result: FitResult, player_id:
     reliability = metric_reliability(conn, DEFAULT_MIN_MINUTES)
     tiers = dict(zip(reliability["metric"], reliability["tier"]))
     pool = fit_result.pool_size
+    at_lowest = _players_at_lowest(conn, group)
 
     def entry(metric: str) -> dict:
-        return _metric_entry(metric, season, percentiles, pool, group_label, tiers)
+        return _metric_entry(metric, season, percentiles, pool, group_label, tiers, at_lowest)
 
     weighted = [
         {**entry(metric), "weight": _format_share(weight)} for metric, weight in fit_result.weights.items()

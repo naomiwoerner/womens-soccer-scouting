@@ -220,13 +220,16 @@ def players_ranked_below(percentile: float, pool_size: int) -> int:
     return count
 
 
-def rank_phrase(percentile: float, pool_size: int, group_label: str) -> str:
+def rank_phrase(
+    percentile: float, pool_size: int, group_label: str, tied_for_lowest: bool = False
+) -> str:
     """Return plain wording for a percentile, such as "better than 15 of 22 other strikers".
 
     The count comes exactly from PERCENT_RANK (see players_ranked_below). Players
     tied with her are not counted as below her, so "best of 23" means no one
-    is level or above. "lowest of 23" means no one ranks below her, which
-    includes being tied for lowest.
+    is level or above. When no one ranks below her, PERCENT_RANK alone cannot
+    tell an outright lowest from a tie, so the caller passes tied_for_lowest
+    (another player shares her value) to get "tied for lowest of 23".
     """
     below = players_ranked_below(percentile, pool_size)
     others = pool_size - 1
@@ -235,7 +238,8 @@ def rank_phrase(percentile: float, pool_size: int, group_label: str) -> str:
     if below == others:
         return f"best of {pool_size} {group_label}"
     if below == 0:
-        return f"lowest of {pool_size} {group_label}"
+        prefix = "tied for lowest" if tied_for_lowest else "lowest"
+        return f"{prefix} of {pool_size} {group_label}"
     return f"better than {below} of {others} other {group_label}"
 
 

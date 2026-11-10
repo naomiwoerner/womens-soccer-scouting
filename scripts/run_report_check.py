@@ -44,41 +44,52 @@ def fail(message: str) -> None:
         print(f"  FAIL {message}")
 
 
-def expected_phrase(below: int, n: int, label: str) -> str:
-    """The wording rule, written out again independently of src/fit.py."""
+def expected_phrase(below: int, level: int, n: int, label: str) -> str:
+    """The wording rule, written out again independently of src/fit.py.
+
+    below is how many players have a strictly lower raw value; level is how
+    many other players share her value.
+    """
     if below == n - 1:
         return f"best of {n} {label}"
     if below == 0:
-        return f"lowest of {n} {label}"
+        return f"{'tied for lowest' if level > 0 else 'lowest'} of {n} {label}"
     return f"better than {below} of {n - 1} other {label}"
+
+
+def raw_counts(values, value) -> tuple[int, int]:
+    """Return (players strictly below, other players level) for one raw value."""
+    return int((values < value).sum()), int((values == value).sum()) - 1
 
 
 def check_rank_phrases(conn: sqlite3.Connection) -> None:
     print("1. Rank phrases against raw values")
     season = pd.read_sql_query("SELECT * FROM player_season_p90", conn)
     pctl = pd.read_sql_query("SELECT * FROM player_percentiles", conn).set_index("player_id")
-    checked = tied_lowest = tied_best = 0
+    checked = outright_lowest = tied_lowest = tied_best = 0
     for group, players in season.groupby("position_group"):
         n, label = len(players), fit.GROUP_LABELS[group]
         for metric in fit.ALLOWED_METRICS:
             column = fit.SEASON_COLUMNS[metric]
             values = players[column].to_numpy()
             for player_id, value in zip(players["player_id"], values):
-                below = int((values < value).sum())
-                level = int((values == value).sum()) - 1
+                below, level = raw_counts(values, value)
                 percentile = pctl.at[player_id, f"{column}_pctl"]
                 derived = fit.players_ranked_below(percentile, n)
-                phrase = fit.rank_phrase(percentile, n, label)
+                phrase = fit.rank_phrase(percentile, n, label, tied_for_lowest=below == 0 and level > 0)
                 if derived != below:
                     fail(f"{group} {metric} {player_id}: derived {derived}, counted {below}")
-                if phrase != expected_phrase(below, n, label):
+                if phrase != expected_phrase(below, level, n, label):
                     fail(f"{group} {metric} {player_id}: phrase {phrase!r}")
+                outright_lowest += below == 0 and level == 0
                 tied_lowest += below == 0 and level > 0
                 tied_best += below + level == n - 1 and level > 0
                 checked += 1
     print(f"  {checked} player-metric pairs checked across {season['position_group'].nunique()} groups")
-    print(f"  {tied_lowest} pairs are 'lowest' while tied with others at the bottom (wording covers ties)")
+    print(f"  {outright_lowest} pairs are outright 'lowest', {tied_lowest} are 'tied for lowest'")
     print(f"  {tied_best} pairs are tied at the top, so none of them is called 'best'")
+    if not outright_lowest or not tied_lowest:
+        fail("the data should contain both outright and tied lowest values")
     for bad in (0.3, 1.5, -0.1):
         try:
             fit.players_ranked_below(bad, 23)
@@ -108,10 +119,13 @@ def check_fact_sheets(conn: sqlite3.Connection) -> None:
     tiers = dict(zip(reliability["metric"], reliability["tier"]))
     sheets = 0
     caveat_counts = {"minutes": 0, "reliability": 0, "pool": 0, "transfer": 0}
+    entry_counts = {"tied": 0}
     for group, weights in REQUIREMENTS.items():
         result = fit.fit_scores(conn, {"position_group": group, "weights": weights}, top_n=500)
         table = result.table
         total = sum(weights.values())
+        group_rows = season[season["position_group"] == group]
+        n, label = len(group_rows), fit.GROUP_LABELS[group]
         for row in table.itertuples(index=False):
             sheet = build_fact_sheet(conn, result, row.player_id)
             s, p = season.loc[row.player_id], pctl.loc[row.player_id]
@@ -136,6 +150,10 @@ def check_fact_sheets(conn: sqlite3.Connection) -> None:
                     fail(f"{where} {metric}: percentile {entry['percentile']}")
                 if entry["reliability"] != tiers[metric]:
                     fail(f"{where} {metric}: tier")
+                below, level = raw_counts(group_rows[column].to_numpy(), raw)
+                if entry["rank"] != expected_phrase(below, level, n, label):
+                    fail(f"{where} {metric}: rank {entry['rank']!r}")
+                entry_counts["tied"] += entry["rank"].startswith("tied for lowest")
 
             for entry in sheet["weighted_metrics"]:
                 check_entry(entry)
@@ -173,6 +191,9 @@ def check_fact_sheets(conn: sqlite3.Connection) -> None:
             if len(sheet["caveats"]) != sum(expected.values()):
                 fail(f"{where}: {len(sheet['caveats'])} caveats")
     print(f"  {sheets} fact sheets checked; caveats raised: {caveat_counts}")
+    print(f"  {entry_counts['tied']} fact-sheet entries say 'tied for lowest', each confirmed from raw values")
+    if not entry_counts["tied"]:
+        fail("no fact sheet exercised the 'tied for lowest' wording")
 
 
 def main() -> None:
