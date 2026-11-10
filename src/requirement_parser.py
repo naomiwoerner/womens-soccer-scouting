@@ -20,7 +20,7 @@ from src.fit import (
     RequirementError,
     validate_requirement,
 )
-from src.llm import LLMError, active_model, call_llm
+from src.llm import LLMError, active_model, call_llm, strip_code_fence
 from src.metrics import METRICS
 
 LLM_MIN_WEIGHT, LLM_MAX_WEIGHT = 1, 5
@@ -30,7 +30,6 @@ MAX_TEXT_CHARS = 2000
 GOALKEEPER_MESSAGE = (
     "Goalkeepers are excluded from this dataset, so the tool can only search for outfield players."
 )
-CODE_FENCE = re.compile(r"^```[A-Za-z]*\s*(.*?)\s*```$", re.DOTALL)
 MINUTES_PATTERN = re.compile(r"(\d[\d,]*)\s*\+?\s*(?:min|mins|minutes)\b")
 
 
@@ -84,11 +83,6 @@ Rules:
 SYSTEM_PROMPT = build_system_prompt()
 
 
-def _strip_code_fence(text: str) -> str:
-    """Return the text inside a Markdown code fence, or the text unchanged."""
-    match = CODE_FENCE.match(text.strip())
-    return match.group(1) if match else text.strip()
-
 
 def _read_reply(raw: str) -> tuple[dict, list[str]]:
     """Return the validated requirement and notes from one of the model's replies.
@@ -97,7 +91,7 @@ def _read_reply(raw: str) -> tuple[dict, list[str]]:
     and _InvalidReply when the reply cannot be used as it stands.
     """
     try:
-        data = json.loads(_strip_code_fence(raw))
+        data = json.loads(strip_code_fence(raw))
     except json.JSONDecodeError as error:
         raise _InvalidReply(f"The reply was not valid JSON ({error.msg}).") from None
     if not isinstance(data, dict):

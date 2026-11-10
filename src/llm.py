@@ -10,6 +10,7 @@ included in an error.
 """
 
 import os
+import re
 import time
 import tomllib
 from pathlib import Path
@@ -64,8 +65,17 @@ _BLOCKED = (
 )
 
 
+CODE_FENCE = re.compile(r"^```[A-Za-z]*\s*(.*?)\s*```$", re.DOTALL)
+
+
 class LLMError(RuntimeError):
     """Raised when the model cannot be reached or gives no usable reply."""
+
+
+def strip_code_fence(text: str) -> str:
+    """Return the text inside a Markdown code fence, or the text unchanged."""
+    match = CODE_FENCE.match(text.strip())
+    return match.group(1) if match else text.strip()
 
 
 def _read_secrets() -> dict:

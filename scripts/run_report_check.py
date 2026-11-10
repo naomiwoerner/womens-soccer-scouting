@@ -8,13 +8,20 @@
 3. build_fact_sheet for every player in the reference pool, under a
    requirement for her group: formatted numbers, shortlist rank, strengths,
    weaknesses and caveats, each recomputed independently.
+4. offline_report for every fact sheet: six well-formed sections, every
+   caveat quoted, no percentiles.
+5. generate_report with simulated model replies: valid, fenced, one retry
+   with the problem fed back, offline fallback, and the request description
+   built from the weights when no text is given.
 
 Run from the project root with: python scripts/run_report_check.py
 """
 
+import json
 import sqlite3
 import sys
 from pathlib import Path
+from unittest import mock
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -23,9 +30,12 @@ import pandas as pd  # noqa: E402
 
 from src import fit  # noqa: E402
 from src.eda import metric_reliability  # noqa: E402
-from src.report import build_fact_sheet  # noqa: E402
+from src import report  # noqa: E402
+from src.llm import LLMError  # noqa: E402
+from src.report import build_fact_sheet, offline_report  # noqa: E402
 
 DB_PATH = PROJECT_ROOT / "data" / "scouting.db"
+REQUEST_TEXT = "A pressing number 9 who works hard off the ball and gets plenty of shots away"
 # One requirement per group: the striker example from try_report plus a simple profile.
 REQUIREMENTS = {
     "Striker": {"pressures": 5, "npxg": 4, "np_shots": 4, "ball_recoveries": 3},
@@ -111,13 +121,13 @@ def check_fit_labels() -> None:
     print(f"  {len(cases)} boundary scores checked")
 
 
-def check_fact_sheets(conn: sqlite3.Connection) -> None:
+def check_fact_sheets(conn: sqlite3.Connection) -> list[dict]:
     print("3. Fact sheets for every player in the reference pool")
     season = pd.read_sql_query("SELECT * FROM player_season_p90", conn).set_index("player_id")
     pctl = pd.read_sql_query("SELECT * FROM player_percentiles", conn).set_index("player_id")
     reliability = metric_reliability(conn, 600)
     tiers = dict(zip(reliability["metric"], reliability["tier"]))
-    sheets = 0
+    sheets, all_sheets = 0, []
     caveat_counts = {"minutes": 0, "reliability": 0, "pool": 0, "transfer": 0}
     entry_counts = {"tied": 0}
     for group, weights in REQUIREMENTS.items():
@@ -128,6 +138,7 @@ def check_fact_sheets(conn: sqlite3.Connection) -> None:
         n, label = len(group_rows), fit.GROUP_LABELS[group]
         for row in table.itertuples(index=False):
             sheet = build_fact_sheet(conn, result, row.player_id)
+            all_sheets.append(sheet)
             s, p = season.loc[row.player_id], pctl.loc[row.player_id]
             sheets += 1
             where = f"{row.player}"
@@ -194,13 +205,151 @@ def check_fact_sheets(conn: sqlite3.Connection) -> None:
     print(f"  {entry_counts['tied']} fact-sheet entries say 'tied for lowest', each confirmed from raw values")
     if not entry_counts["tied"]:
         fail("no fact sheet exercised the 'tied for lowest' wording")
+    return all_sheets
+
+
+def check_offline_reports(sheets: list[dict]) -> None:
+    print("4. Offline reports for every fact sheet")
+    for sheet in sheets:
+        name = sheet["player"]["name"]
+        sections = offline_report(sheet).sections
+        if tuple(sections) != report.SECTIONS:
+            fail(f"{name}: offline sections {tuple(sections)}")
+        for section, value in sections.items():
+            if isinstance(value, list):
+                ok = report.MIN_BULLETS <= len(value) <= report.MAX_BULLETS and all(v.strip() for v in value)
+            else:
+                ok = isinstance(value, str) and bool(value.strip())
+            if not ok:
+                fail(f"{name}: offline section {section} is malformed")
+        text = json.dumps(sections, ensure_ascii=False)
+        caveat_text = json.dumps(sections["caveats"], ensure_ascii=False)
+        for caveat in sheet["caveats"] or [report.NO_CAVEATS]:
+            if json.dumps(caveat, ensure_ascii=False)[1:-1] not in caveat_text:
+                fail(f"{name}: caveat missing from offline report")
+        # Caveats may mention percentiles as a concept; the template's own wording may not.
+        own_text = json.dumps({k: v for k, v in sections.items() if k != "caveats"}, ensure_ascii=False)
+        if "percentile" in own_text:
+            fail(f"{name}: offline report mentions percentiles outside the caveats")
+        for entry in sheet["weighted_metrics"]:
+            if entry["weight"] not in text or entry["value"] not in text:
+                fail(f"{name}: offline report lacks {entry['metric']} weight or value")
+    print(f"  {len(sheets)} offline reports: six well-formed sections, every caveat quoted, no percentiles")
+
+
+VALID_REPORT = {
+    "summary": "Summary.",
+    "strengths": ["One.", "Two."],
+    "weaknesses": ["One.", "Two."],
+    "playing_style": "Her numbers suggest a pressing forward.",
+    "fit_for_profile": ["One.", "Two."],
+    "caveats": ["One.", "Two."],
+}
+
+
+def run_generator(conn, result, player_id, replies, request_text=REQUEST_TEXT):
+    """Run generate_report with simulated model replies (strings or exceptions)."""
+    with (
+        mock.patch.object(report, "call_llm", side_effect=replies) as call,
+        mock.patch.object(report, "active_model", return_value=("gemini", "gemini-test")),
+    ):
+        produced = report.generate_report(conn, request_text, result, player_id)
+    return produced, call
+
+
+def check_generator(conn: sqlite3.Connection) -> None:
+    print("5. Report generator with simulated model replies")
+    requirement = {"position_group": "Striker", "weights": REQUIREMENTS["Striker"], "min_minutes": 600}
+    result = fit.fit_scores(conn, requirement, top_n=1)
+    player_id = int(result.table["player_id"].iloc[0])
+    valid = json.dumps(VALID_REPORT)
+    bad_json, missing = "not json", json.dumps({k: v for k, v in VALID_REPORT.items() if k != "caveats"})
+    empty_list = json.dumps({**VALID_REPORT, "strengths": []})
+    extra_key = json.dumps({**VALID_REPORT, "rating": "A"})
+    non_string = json.dumps({**VALID_REPORT, "weaknesses": ["One.", 2]})
+
+    def expect(label, replies, source, calls, check_extra=None, request_text=REQUEST_TEXT):
+        produced, call = run_generator(conn, result, player_id, replies, request_text)
+        ok = produced.source == source and call.call_count == calls
+        if source == "llm":
+            ok = ok and (produced.provider, produced.model) == ("gemini", "gemini-test")
+            ok = ok and produced.sections == VALID_REPORT
+        else:
+            ok = ok and (produced.provider, produced.model) == (None, None)
+            ok = ok and produced.sections == offline_report(produced.fact_sheet).sections
+        if check_extra is not None:
+            ok = ok and check_extra(produced, call)
+        print(f"  [{'ok' if ok else 'FAIL'}] {label}: {produced.source}, {call.call_count} call(s)")
+        if not ok:
+            fail(f"generator: {label}")
+        return produced, call
+
+    def sends_request_and_sheet(produced, call):
+        system, message = call.call_args_list[0].args
+        sheet = json.dumps(produced.fact_sheet, indent=2, ensure_ascii=False)
+        return system == report.SYSTEM_PROMPT and REQUEST_TEXT in message and sheet in message
+
+    def retry_explains(problem):
+        def check(produced, call):
+            retry = call.call_args_list[1].args[1]
+            return "Your previous reply" in retry and problem in retry and REQUEST_TEXT in retry
+        return check
+
+    def fallback_note(reason):
+        def check(produced, call):
+            return produced.notes[0].startswith(f"Used the offline report template. Reason: {reason}")
+        return check
+
+    expect("valid reply", [valid], "llm", 1, sends_request_and_sheet)
+    expect("fenced reply", [f"```json\n{valid}\n```"], "llm", 1)
+    expect("invalid JSON, then valid", [bad_json, valid], "llm", 2, retry_explains("not valid JSON"))
+    expect("missing section, then valid", [missing, valid], "llm", 2, retry_explains("Missing section(s): caveats"))
+    expect("unexpected key, then valid", [extra_key, valid], "llm", 2, retry_explains("Unexpected key(s): rating"))
+    expect("non-string bullet, then valid", [non_string, valid], "llm", 2, retry_explains('"weaknesses" must be'))
+    expect(
+        "empty section twice: offline",
+        [empty_list, empty_list],
+        "offline",
+        2,
+        fallback_note("The model's reply could not be used after one retry"),
+    )
+    expect(
+        "model unavailable: offline",
+        [LLMError("The model did not respond within 30 seconds.")],
+        "offline",
+        1,
+        fallback_note("The model did not respond within 30 seconds."),
+    )
+    expect(
+        "model unavailable on the retry: offline",
+        [bad_json, LLMError("The model returned an empty reply.")],
+        "offline",
+        2,
+        fallback_note("The model returned an empty reply."),
+    )
+    description = "Striker; weights: pressures 31%, npxG 25%, non-penalty shots 25%, ball recoveries 19%; at least 600 minutes"
+
+    def uses_description(produced, call):
+        message = call.call_args_list[0].args[1]
+        return f"Scout's request:\n{description}\n" in message and description in produced.notes[0]
+
+    expect("no request text: description from weights", [valid], "llm", 1, uses_description, request_text=None)
+    expect("blank request text: description from weights", [valid], "llm", 1, uses_description, request_text="  ")
+    prompt_ok = all(f'"{name}"' in report.SYSTEM_PROMPT for name in report.SECTIONS) and (
+        'Do not quote the "percentile" fields' in report.SYSTEM_PROMPT
+    )
+    print(f"  [{'ok' if prompt_ok else 'FAIL'}] system prompt names all six sections and bans quoting percentiles")
+    if not prompt_ok:
+        fail("system prompt")
 
 
 def main() -> None:
     with sqlite3.connect(DB_PATH) as conn:
         check_rank_phrases(conn)
         check_fit_labels()
-        check_fact_sheets(conn)
+        sheets = check_fact_sheets(conn)
+        check_offline_reports(sheets)
+        check_generator(conn)
     conn.close()
     print()
     if failures:
