@@ -1,0 +1,98 @@
+{
+  "meta": {
+    "provider": "gemini",
+    "model": "gemini-3.5-flash-lite",
+    "date": "2026-11-10",
+    "stopped": false,
+    "calls": 97,
+    "unavailable": 0
+  },
+  "parser": {
+    "runs": 66,
+    "model_answered": 66,
+    "offline_fallbacks": 0,
+    "fallback_rate": 0.0,
+    "fallback_reasons": {},
+    "group_accuracy": 1.0,
+    "group_runs": 54,
+    "quality_recall": 1.0,
+    "qualities_met": 78,
+    "qualities_required": 78,
+    "minutes_correct": 1.0,
+    "minutes_runs": 6,
+    "rejections_correct": 1.0,
+    "reject_runs": 12,
+    "wrongly_rejected": 0,
+    "consistent_group_cases": 18,
+    "consistent_top_metric_cases": 13,
+    "repeated_cases": 18,
+    "inconsistent_group": [],
+    "inconsistent_top_metric": [
+      "P02",
+      "P11",
+      "P13",
+      "P14",
+      "P18"
+    ],
+    "latency": {
+      "median_s": 1.5470000000000002,
+      "p90_s": 6.739,
+      "n": 66
+    },
+    "misses": [],
+    "offline_runs": []
+  },
+  "reports": {
+    "reports": 30,
+    "first_attempt": {
+      "verified": 27,
+      "warnings": 3
+    },
+    "model_drafts": 30,
+    "first_attempt_without_failure": 1.0,
+    "final": {
+      "verified": 27,
+      "warnings": 3
+    },
+    "regenerated": 0,
+    "offline": 0,
+    "model_calls": 30,
+    "latency": {
+      "median_s": 2.864,
+      "p90_s": 8.384,
+      "n": 30
+    },
+    "first_attempt_failures": [],
+    "offline_reports": [],
+    "warnings": {
+      "successful dribbles has low reliability and is mentioned, but the caveats section does not name it.": 1,
+      "non-penalty expected goals (npxG) has low reliability and is mentioned, but the caveats section does not name it.": 2
+    }
+  },
+  "thresholds": [
+    {
+      "measure": "Parser group accuracy",
+      "value": 1.0,
+      "target": "≥ 90%",
+      "result": "PASS"
+    },
+    {
+      "measure": "Parser quality recall",
+      "value": 1.0,
+      "target": "≥ 80%",
+      "result": "PASS"
+    },
+    {
+      "measure": "First-attempt reports without failure",
+      "value": 1.0,
+      "target": "≥ 90%",
+      "result": "PASS"
+    },
+    {
+      "measure": "Unavailable model calls",
+      "value": 0.0,
+      "target": "≤ 10%",
+      "result": "PASS"
+    }
+  ]
+}
