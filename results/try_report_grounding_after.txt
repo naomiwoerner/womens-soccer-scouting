@@ -1,0 +1,391 @@
+Provider: gemini; model: gemini-3.5-flash-lite
+Request: A pressing number 9 who works hard off the ball and gets plenty of shots away
+
+==============================================================================
+Rank 1: Fenna Kalma (VfL Wolfsburg WFC), fit 78.7
+==============================================================================
+
+--- Fact sheet ---
+{
+  "player": {
+    "name": "Fenna Kalma",
+    "teams": [
+      "VfL Wolfsburg WFC"
+    ],
+    "position_group": "Striker",
+    "minutes": "687",
+    "matches": "20"
+  },
+  "shortlist": {
+    "rank": "1",
+    "eligible_players": "23",
+    "reference_pool": "23",
+    "min_minutes": "600"
+  },
+  "fit": {
+    "score": "78.7",
+    "label": "Strong fit"
+  },
+  "weighted_metrics": [
+    {
+      "metric": "pressures",
+      "name": "pressures",
+      "value": "21.50",
+      "unit": "per 90",
+      "percentile": "55",
+      "rank": "better than 12 of 22 other strikers",
+      "reliability": "moderate",
+      "weight": "31%",
+      "match": "partial match"
+    },
+    {
+      "metric": "npxg",
+      "name": "non-penalty expected goals (npxG)",
+      "value": "0.59",
+      "unit": "per 90",
+      "percentile": "95",
+      "rank": "better than 21 of 22 other strikers",
+      "reliability": "low",
+      "weight": "25%",
+      "match": "clear match"
+    },
+    {
+      "metric": "np_shots",
+      "name": "non-penalty shots",
+      "value": "4.33",
+      "unit": "per 90",
+      "percentile": "100",
+      "rank": "best of 23 strikers",
+      "reliability": "low",
+      "weight": "25%",
+      "match": "clear match"
+    },
+    {
+      "metric": "ball_recoveries",
+      "name": "ball recoveries",
+      "value": "4.06",
+      "unit": "per 90",
+      "percentile": "68",
+      "rank": "better than 15 of 22 other strikers",
+      "reliability": "low",
+      "weight": "19%",
+      "match": "partial match"
+    }
+  ],
+  "strengths": [
+    {
+      "metric": "np_shots",
+      "name": "non-penalty shots",
+      "value": "4.33",
+      "unit": "per 90",
+      "percentile": "100",
+      "rank": "best of 23 strikers",
+      "reliability": "low"
+    },
+    {
+      "metric": "npxg",
+      "name": "non-penalty expected goals (npxG)",
+      "value": "0.59",
+      "unit": "per 90",
+      "percentile": "95",
+      "rank": "better than 21 of 22 other strikers",
+      "reliability": "low"
+    },
+    {
+      "metric": "aerial_duels_won",
+      "name": "aerial duels won",
+      "value": "3.28",
+      "unit": "per 90",
+      "percentile": "91",
+      "rank": "better than 20 of 22 other strikers",
+      "reliability": "moderate"
+    }
+  ],
+  "weaknesses": [
+    {
+      "metric": "progressive_carries",
+      "name": "progressive carries",
+      "value": "0.52",
+      "unit": "per 90",
+      "percentile": "0",
+      "rank": "lowest of 23 strikers",
+      "reliability": "high"
+    },
+    {
+      "metric": "successful_dribbles",
+      "name": "successful dribbles",
+      "value": "0.13",
+      "unit": "per 90",
+      "percentile": "0",
+      "rank": "lowest of 23 strikers",
+      "reliability": "low"
+    },
+    {
+      "metric": "tackles_interceptions",
+      "name": "tackles won and interceptions",
+      "value": "0.66",
+      "unit": "per 90",
+      "percentile": "5",
+      "rank": "better than 1 of 22 other strikers",
+      "reliability": "low"
+    }
+  ],
+  "caveats": [
+    "Based on limited minutes: 687 minutes in 20 matches, under 900 minutes, so her percentiles could move with more games.",
+    "69% of the fit score's weight is on metrics with low reliability at 600 minutes (non-penalty expected goals (npxG), non-penalty shots, ball recoveries), so the score is a weaker signal than it looks.",
+    "Small reference pool: her percentiles compare her with only 23 strikers, so one place in a ranking is a big step in percentile."
+  ]
+}
+
+--- Model report (llm; gemini, gemini-3.5-flash-lite) ---
+
+Summary
+  Fenna Kalma is a striker for VfL Wolfsburg WFC who earned a fit score of 78.7, labeling her a Strong fit and placing her at rank 1 of 23 eligible strikers.
+
+Strengths
+  - non-penalty shots: 4.33 per 90 (best of 23 strikers)
+  - non-penalty expected goals (npxG): 0.59 per 90 (better than 21 of 22 other strikers)
+  - aerial duels won: 3.28 per 90 (better than 20 of 22 other strikers)
+
+Weaknesses
+  - progressive carries: 0.52 per 90 (lowest of 23 strikers)
+  - successful dribbles: 0.13 per 90 (lowest of 23 strikers)
+  - tackles won and interceptions: 0.66 per 90 (better than 1 of 22 other strikers)
+
+Playing style
+  Her numbers suggest a penalty-box focal point who accumulates non-penalty shots at a rate of 4.33 per 90 and non-penalty expected goals (npxG) at 0.59 per 90. She also records aerial duels won at 3.28 per 90.
+
+Fit for profile
+  Her weighted metrics are pressures, 31% of the score: better than 12 of 22 other strikers; non-penalty expected goals (npxG), 25% of the score: better than 21 of 22 other strikers; non-penalty shots, 25% of the score: best of 23 strikers; and ball recoveries, 19% of the score: better than 15 of 22 other strikers. She clearly meets the requirements for getting plenty of shots away, while she meets the pressing and off-the-ball work requirements only partly.
+
+Caveats
+  - Based on limited minutes: 687 minutes in 20 matches, under 900 minutes, so her percentiles could move with more games.
+  - 69% of the fit score's weight is on metrics with low reliability at 600 minutes (non-penalty expected goals (npxG), non-penalty shots, ball recoveries), so the score is a weaker signal than it looks.
+  - Small reference pool: her percentiles compare her with only 23 strikers, so one place in a ranking is a big step in percentile.
+  - Non-penalty expected goals (npxG), non-penalty shots, ball recoveries, successful dribbles, and tackles won and interceptions have low reliability.
+
+Fact check: verified (47 numbers checked)
+
+--- Offline report ---
+
+Summary
+  Fenna Kalma (VfL Wolfsburg WFC, Striker) is a Strong fit for this profile, with a fit score of 78.7. She ranks 1 of 23 eligible strikers with at least 600 minutes, from 687 minutes in 20 matches.
+
+Strengths
+  - Non-penalty shots: 4.33 per 90, best of 23 strikers (low reliability at this sample size).
+  - Non-penalty expected goals (npxG): 0.59 per 90, better than 21 of 22 other strikers (low reliability at this sample size).
+  - Aerial duels won: 3.28 per 90, better than 20 of 22 other strikers.
+
+Weaknesses
+  - Progressive carries: 0.52 per 90, lowest of 23 strikers.
+  - Successful dribbles: 0.13 per 90, lowest of 23 strikers (low reliability at this sample size).
+  - Tackles won and interceptions: 0.66 per 90, better than 1 of 22 other strikers (low reliability at this sample size).
+
+Playing style
+  Inferred from the metrics only: her numbers stand out most for non-penalty shots, non-penalty expected goals (npxG) and aerial duels won, and are lowest for progressive carries, successful dribbles and tackles won and interceptions.
+
+Fit for profile
+  Weighted metrics: pressures (31%), 21.50 per 90, better than 12 of 22 other strikers; non-penalty expected goals (npxG) (25%), 0.59 per 90, better than 21 of 22 other strikers; non-penalty shots (25%), 4.33 per 90, best of 23 strikers; ball recoveries (19%), 4.06 per 90, better than 15 of 22 other strikers. She clearly meets the request on non-penalty expected goals (npxG) and non-penalty shots, where she is better than at least three quarters of the other strikers, but only partly on pressures and ball recoveries.
+
+Caveats
+  - Based on limited minutes: 687 minutes in 20 matches, under 900 minutes, so her percentiles could move with more games.
+  - 69% of the fit score's weight is on metrics with low reliability at 600 minutes (non-penalty expected goals (npxG), non-penalty shots, ball recoveries), so the score is a weaker signal than it looks.
+  - Small reference pool: her percentiles compare her with only 23 strikers, so one place in a ranking is a big step in percentile.
+  - Successful dribbles and tackles won and interceptions have low reliability at 600 minutes, so read them as a weak signal.
+
+Fact check: verified (53 numbers checked)
+
+==============================================================================
+Rank 2: Ramona Maier (SGS Essen 19/68), fit 73.9
+==============================================================================
+
+--- Fact sheet ---
+{
+  "player": {
+    "name": "Ramona Maier",
+    "teams": [
+      "SGS Essen 19/68"
+    ],
+    "position_group": "Striker",
+    "minutes": "2006",
+    "matches": "22"
+  },
+  "shortlist": {
+    "rank": "2",
+    "eligible_players": "23",
+    "reference_pool": "23",
+    "min_minutes": "600"
+  },
+  "fit": {
+    "score": "73.9",
+    "label": "Strong fit"
+  },
+  "weighted_metrics": [
+    {
+      "metric": "pressures",
+      "name": "pressures",
+      "value": "27.45",
+      "unit": "per 90",
+      "percentile": "91",
+      "rank": "better than 20 of 22 other strikers",
+      "reliability": "moderate",
+      "weight": "31%",
+      "match": "clear match"
+    },
+    {
+      "metric": "npxg",
+      "name": "non-penalty expected goals (npxG)",
+      "value": "0.28",
+      "unit": "per 90",
+      "percentile": "55",
+      "rank": "better than 12 of 22 other strikers",
+      "reliability": "low",
+      "weight": "25%",
+      "match": "partial match"
+    },
+    {
+      "metric": "np_shots",
+      "name": "non-penalty shots",
+      "value": "2.29",
+      "unit": "per 90",
+      "percentile": "73",
+      "rank": "better than 16 of 22 other strikers",
+      "reliability": "low",
+      "weight": "25%",
+      "match": "partial match"
+    },
+    {
+      "metric": "ball_recoveries",
+      "name": "ball recoveries",
+      "value": "4.26",
+      "unit": "per 90",
+      "percentile": "73",
+      "rank": "better than 16 of 22 other strikers",
+      "reliability": "low",
+      "weight": "19%",
+      "match": "partial match"
+    }
+  ],
+  "strengths": [
+    {
+      "metric": "progressive_carries",
+      "name": "progressive carries",
+      "value": "3.86",
+      "unit": "per 90",
+      "percentile": "100",
+      "rank": "best of 23 strikers",
+      "reliability": "high"
+    },
+    {
+      "metric": "pressures",
+      "name": "pressures",
+      "value": "27.45",
+      "unit": "per 90",
+      "percentile": "91",
+      "rank": "better than 20 of 22 other strikers",
+      "reliability": "moderate"
+    },
+    {
+      "metric": "successful_dribbles",
+      "name": "successful dribbles",
+      "value": "1.21",
+      "unit": "per 90",
+      "percentile": "82",
+      "rank": "better than 18 of 22 other strikers",
+      "reliability": "low"
+    }
+  ],
+  "weaknesses": [
+    {
+      "metric": "passes_completed",
+      "name": "completed passes",
+      "value": "9.51",
+      "unit": "per 90",
+      "percentile": "9",
+      "rank": "better than 2 of 22 other strikers",
+      "reliability": "high"
+    },
+    {
+      "metric": "pass_completion_pct",
+      "name": "pass completion",
+      "value": "57.3%",
+      "unit": "of passes completed",
+      "percentile": "14",
+      "rank": "better than 3 of 22 other strikers",
+      "reliability": "high"
+    },
+    {
+      "metric": "progressive_passes",
+      "name": "progressive passes",
+      "value": "1.08",
+      "unit": "per 90",
+      "percentile": "14",
+      "rank": "better than 3 of 22 other strikers",
+      "reliability": "high"
+    }
+  ],
+  "caveats": [
+    "69% of the fit score's weight is on metrics with low reliability at 600 minutes (non-penalty expected goals (npxG), non-penalty shots, ball recoveries), so the score is a weaker signal than it looks.",
+    "Small reference pool: her percentiles compare her with only 23 strikers, so one place in a ranking is a big step in percentile."
+  ]
+}
+
+--- Model report (llm; gemini, gemini-3.5-flash-lite) ---
+
+Summary
+  Ramona Maier plays as a striker for SGS Essen 19/68. She receives a fit score of 73.9, which is labeled as a Strong fit, and ranks 2 of 23 eligible strikers on the shortlist.
+
+Strengths
+  - progressive carries: 3.86 per 90 (best of 23 strikers)
+  - pressures: 27.45 per 90 (better than 20 of 22 other strikers)
+  - successful dribbles: 1.21 per 90 (better than 18 of 22 other strikers)
+
+Weaknesses
+  - completed passes: 9.51 per 90 (better than 2 of 22 other strikers)
+  - pass completion: 57.3% of passes completed (better than 3 of 22 other strikers)
+  - progressive passes: 1.08 per 90 (better than 3 of 22 other strikers)
+
+Playing style
+  Her numbers suggest an active, ball-carrying forward whose metrics include progressive carries at 3.86 per 90 and successful dribbles at 1.21 per 90. She also registers high defensive engagement, shown by pressures at 27.45 per 90 and ball recoveries at 4.26 per 90. Her non-penalty shots stand at 2.29 per 90 alongside a non-penalty expected goals (npxG) value of 0.28 per 90.
+
+Fit for profile
+  - pressures, 31% of the score: better than 20 of 22 other strikers
+  - non-penalty expected goals (npxG), 25% of the score: better than 12 of 22 other strikers
+  - non-penalty shots, 25% of the score: better than 16 of 22 other strikers
+  - ball recoveries, 19% of the score: better than 16 of 22 other strikers
+  - She clearly meets the requirement for defensive work through pressures, while meeting the requirements for non-penalty expected goals (npxG), non-penalty shots, and ball recoveries only partly.
+
+Caveats
+  - 69% of the fit score's weight is on metrics with low reliability at 600 minutes (non-penalty expected goals (npxG), non-penalty shots, ball recoveries), so the score is a weaker signal than it looks.
+  - Small reference pool: her percentiles compare her with only 23 strikers, so one place in a ranking is a big step in percentile.
+  - Low-reliability metrics relied upon above: non-penalty expected goals (npxG), non-penalty shots, ball recoveries, and successful dribbles.
+
+Fact check: verified (54 numbers checked)
+
+--- Offline report ---
+
+Summary
+  Ramona Maier (SGS Essen 19/68, Striker) is a Strong fit for this profile, with a fit score of 73.9. She ranks 2 of 23 eligible strikers with at least 600 minutes, from 2006 minutes in 22 matches.
+
+Strengths
+  - Progressive carries: 3.86 per 90, best of 23 strikers.
+  - Pressures: 27.45 per 90, better than 20 of 22 other strikers.
+  - Successful dribbles: 1.21 per 90, better than 18 of 22 other strikers (low reliability at this sample size).
+
+Weaknesses
+  - Completed passes: 9.51 per 90, better than 2 of 22 other strikers.
+  - Pass completion: 57.3% of passes completed, better than 3 of 22 other strikers.
+  - Progressive passes: 1.08 per 90, better than 3 of 22 other strikers.
+
+Playing style
+  Inferred from the metrics only: her numbers stand out most for progressive carries, pressures and successful dribbles, and are lowest for completed passes, pass completion and progressive passes.
+
+Fit for profile
+  Weighted metrics: pressures (31%), 27.45 per 90, better than 20 of 22 other strikers; non-penalty expected goals (npxG) (25%), 0.28 per 90, better than 12 of 22 other strikers; non-penalty shots (25%), 2.29 per 90, better than 16 of 22 other strikers; ball recoveries (19%), 4.26 per 90, better than 16 of 22 other strikers. She clearly meets the request on pressures, where she is better than at least three quarters of the other strikers, but only partly on non-penalty expected goals (npxG), non-penalty shots and ball recoveries.
+
+Caveats
+  - 69% of the fit score's weight is on metrics with low reliability at 600 minutes (non-penalty expected goals (npxG), non-penalty shots, ball recoveries), so the score is a weaker signal than it looks.
+  - Small reference pool: her percentiles compare her with only 23 strikers, so one place in a ranking is a big step in percentile.
+  - Successful dribbles has low reliability at 600 minutes, so read it as a weak signal.
+
+Fact check: verified (54 numbers checked)

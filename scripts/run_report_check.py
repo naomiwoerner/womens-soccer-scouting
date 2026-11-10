@@ -256,9 +256,19 @@ def check_offline_reports(sheets: list[dict]) -> None:
                 fail(f"{name}: offline section {section} is malformed")
         text = json.dumps(sections, ensure_ascii=False)
         caveat_text = json.dumps(sections["caveats"], ensure_ascii=False)
-        for caveat in sheet["caveats"] or [report.NO_CAVEATS]:
+        mentioned = sheet["weighted_metrics"] + sheet["strengths"] + sheet["weaknesses"]
+        unflagged = {
+            e["name"] for e in mentioned if e["reliability"] == "low" and e["name"] not in " ".join(sheet["caveats"])
+        }
+        expected_caveats = list(sheet["caveats"]) or ([] if unflagged else [report.NO_CAVEATS])
+        for caveat in expected_caveats:
             if json.dumps(caveat, ensure_ascii=False)[1:-1] not in caveat_text:
                 fail(f"{name}: caveat missing from offline report")
+        for metric_name in unflagged:
+            if metric_name.lower() not in caveat_text.lower() or "low reliability at 600 minutes" not in caveat_text:
+                fail(f"{name}: low-reliability {metric_name} not named in the caveats")
+        if unflagged and report.NO_CAVEATS in caveat_text:
+            fail(f"{name}: says no caveats while naming low-reliability metrics")
         # Caveats may mention percentiles as a concept; the template's own wording may not.
         own_text = json.dumps({k: v for k, v in sections.items() if k != "caveats"}, ensure_ascii=False)
         if "percentile" in own_text:
@@ -316,6 +326,11 @@ def check_generator(conn: sqlite3.Connection) -> None:
     requirement = {"position_group": "Striker", "weights": REQUIREMENTS["Striker"], "min_minutes": 600}
     result = fit.fit_scores(conn, requirement, top_n=1)
     player_id = int(result.table["player_id"].iloc[0])
+    # A grounded reply (the offline template's sections), so the fact check passes
+    # and these cases test only the JSON handling. Grounding paths are covered in
+    # run_grounding_check.py.
+    VALID_REPORT.clear()
+    VALID_REPORT.update(offline_report(build_fact_sheet(conn, result, player_id)).sections)
     valid = json.dumps(VALID_REPORT)
     bad_json, missing = "not json", json.dumps({k: v for k, v in VALID_REPORT.items() if k != "caveats"})
     empty_list = json.dumps({**VALID_REPORT, "strengths": []})
@@ -365,7 +380,7 @@ def check_generator(conn: sqlite3.Connection) -> None:
         [empty_list, empty_list],
         "offline",
         2,
-        fallback_note("The model's reply could not be used after one retry"),
+        fallback_note("The model's reply could not be used"),
     )
     expect(
         "model unavailable: offline",
