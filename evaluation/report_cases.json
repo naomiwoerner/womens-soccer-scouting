@@ -1,0 +1,82 @@
+[
+  {
+    "id": "R01",
+    "request_text": "A pressing number 9 who works hard off the ball and gets plenty of shots away",
+    "position_group": "Striker",
+    "weights": {"pressures": 5, "npxg": 4, "np_shots": 4, "ball_recoveries": 3},
+    "min_minutes": 600,
+    "note": "Top player under 900 minutes (Fenna Kalma, 687), so the limited-minutes caveat must appear. Mostly low-reliability weights (69%)."
+  },
+  {
+    "id": "R02",
+    "request_text": "A target forward who wins her aerial duels and gets on the end of good chances, with at least 900 minutes",
+    "position_group": "Striker",
+    "weights": {"aerial_duels_won": 5, "npxg": 3},
+    "min_minutes": 900,
+    "note": "Raised minutes threshold: 15 of 23 strikers eligible."
+  },
+  {
+    "id": "R03",
+    "request_text": "A ball-playing centre-back who progresses play, keeps possession and is still solid in the air",
+    "position_group": "Center Back",
+    "weights": {"progressive_passes": 5, "pass_completion_pct": 4, "passes_completed": 3, "aerial_duels_won": 2},
+    "min_minutes": 600,
+    "note": "Mostly high-reliability weights (86%); top 3 are within 1.2 points of each other. Rank 2 has 816 minutes."
+  },
+  {
+    "id": "R04",
+    "request_text": "A no-nonsense defender: dominant in the air, wins tackles and makes interceptions, mops up loose balls",
+    "position_group": "Center Back",
+    "weights": {"aerial_duels_won": 4, "tackles_interceptions": 4, "ball_recoveries": 3},
+    "min_minutes": 900,
+    "note": "Defensive centre-back; mostly low-reliability weights (64%)."
+  },
+  {
+    "id": "R05",
+    "request_text": "An attacking full back who carries the ball forward and supplies the final third",
+    "position_group": "Full Back/Wing Back",
+    "weights": {"progressive_carries": 5, "xa": 3, "passes_into_final_third": 3},
+    "min_minutes": 600,
+    "note": "Mixed reliability (45% high, 27% low)."
+  },
+  {
+    "id": "R06",
+    "request_text": "A reliable defensive full back with a full season behind her, strong in the tackle and pressing",
+    "position_group": "Full Back/Wing Back",
+    "weights": {"tackles_interceptions": 5, "pressures": 3, "ball_recoveries": 3},
+    "min_minutes": 1200,
+    "note": "Maximum minutes threshold (1,200): 24 of 31 eligible."
+  },
+  {
+    "id": "R07",
+    "request_text": "A deep-lying playmaker who keeps the ball moving and breaks lines with her passing",
+    "position_group": "Defensive/Central Midfield",
+    "weights": {"passes_completed": 5, "progressive_passes": 4, "pass_completion_pct": 3},
+    "min_minutes": 900,
+    "note": "All weights high-reliability (100%), so no reliability caveat is expected."
+  },
+  {
+    "id": "R08",
+    "request_text": "A ball-winning number 6 who recovers possession and presses high",
+    "position_group": "Defensive/Central Midfield",
+    "weights": {"ball_recoveries": 5, "tackles_interceptions": 4, "pressures": 3},
+    "min_minutes": 600,
+    "note": "Mostly low-reliability weights (75%)."
+  },
+  {
+    "id": "R09",
+    "request_text": "A creative number 10 who creates chances for others",
+    "position_group": "Attacking Midfield/Winger",
+    "weights": {"xa": 5, "key_passes": 4, "passes_into_final_third": 3},
+    "min_minutes": 600,
+    "note": "Mostly low-reliability weights (75%)."
+  },
+  {
+    "id": "R10",
+    "request_text": "A direct winger who takes on defenders, carries the ball and shoots",
+    "position_group": "Attacking Midfield/Winger",
+    "weights": {"successful_dribbles": 5, "progressive_carries": 4, "np_shots": 3},
+    "min_minutes": 600,
+    "note": "Rank 3 has 660 minutes (Sveindís Jane Jónsdóttir), so a second limited-minutes case."
+  }
+]
