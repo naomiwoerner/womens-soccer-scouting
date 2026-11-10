@@ -1,7 +1,7 @@
 """Try the requirement parser on example requests and show each shortlist.
 
-Uses Claude when an API key is configured; otherwise runs the offline keyword
-parser only and says so. Run from the project root with:
+Uses the configured model (LLM_PROVIDER, see src/llm.py) when its API key is
+set; otherwise runs the offline keyword parser only and says so. Run from the project root with:
 python scripts/try_parser.py
 """
 
@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.fit import RequirementError, fit_scores  # noqa: E402
-from src.llm import MODEL, has_api_key  # noqa: E402
+from src.llm import KEY_NAMES, LLMError, active_model, has_api_key  # noqa: E402
 from src.requirement_parser import offline_parse, parse_requirement  # noqa: E402
 
 DB_PATH = PROJECT_ROOT / "data" / "scouting.db"
@@ -40,7 +40,8 @@ def show(connection: sqlite3.Connection, text: str, use_llm: bool) -> None:
 
     requirement = result.requirement
     weights = ", ".join(f"{name} {weight:.2f}" for name, weight in requirement["weights"].items())
-    print(f"  Source: {result.source}")
+    answered_by = f" ({result.provider}, {result.model})" if result.provider else ""
+    print(f"  Source: {result.source}{answered_by}")
     print(f"  Group: {requirement['position_group']}; min_minutes: {requirement['min_minutes']}")
     print(f"  Weights: {weights}")
     for note in result.notes:
@@ -56,11 +57,18 @@ def show(connection: sqlite3.Connection, text: str, use_llm: bool) -> None:
 
 
 def main() -> None:
-    use_llm = has_api_key()
+    try:
+        provider, model = active_model()
+    except LLMError as error:
+        print(f"Settings problem: {error}\nRunning the offline keyword parser only.")
+        provider = model = None
+    use_llm = provider is not None and has_api_key()
+    if provider is not None:
+        print(f"Provider: {provider}; model: {model}")
     if use_llm:
-        print(f"API key found: parsing with {MODEL}, falling back to offline rules if needed.")
-    else:
-        print("No API key found: running the offline keyword parser only.")
+        print("API key found: parsing with the model, falling back to offline rules if needed.")
+    elif provider is not None:
+        print(f"No {KEY_NAMES[provider]} found: running the offline keyword parser only.")
     with sqlite3.connect(DB_PATH) as connection:
         for text in EXAMPLES:
             show(connection, text, use_llm)

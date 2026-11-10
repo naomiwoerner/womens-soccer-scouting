@@ -1,7 +1,8 @@
 """Turn a scout's free-text request into a validated fit-score requirement.
 
-parse_requirement asks Claude first and falls back to deterministic keyword
-rules (offline_parse) when Claude is unavailable or its reply cannot be used.
+parse_requirement asks the configured language model (see src.llm) first and
+falls back to deterministic keyword rules (offline_parse) when the model is
+unavailable or its reply cannot be used.
 Every requirement, from either path, passes src.fit.validate_requirement.
 """
 
@@ -19,7 +20,7 @@ from src.fit import (
     RequirementError,
     validate_requirement,
 )
-from src.llm import LLMError, call_llm
+from src.llm import LLMError, active_model, call_llm
 from src.metrics import METRICS
 
 LLM_MIN_WEIGHT, LLM_MAX_WEIGHT = 1, 5
@@ -39,17 +40,21 @@ class ParseResult:
 
     requirement is validated, with weights normalized to sum to 1. source is
     "llm" or "offline". notes explain the interpretation and any fallback.
-    raw_response is Claude's last reply, or None for the offline parser.
+    raw_response is the model's last reply. provider and model name the model
+    that answered, such as "gemini" and "gemini-3.8-flash". All three are None
+    when the offline parser produced the result, including after a fallback.
     """
 
     requirement: dict
     source: str
     notes: list[str]
     raw_response: str | None
+    provider: str | None = None
+    model: str | None = None
 
 
 class _InvalidReply(Exception):
-    """Claude's reply could not be used. The message is shown to Claude on the retry."""
+    """The model's reply could not be used. The message is shown to the model on the retry."""
 
 
 def build_system_prompt() -> str:
@@ -86,9 +91,9 @@ def _strip_code_fence(text: str) -> str:
 
 
 def _read_reply(raw: str) -> tuple[dict, list[str]]:
-    """Return the validated requirement and notes from one of Claude's replies.
+    """Return the validated requirement and notes from one of the model's replies.
 
-    Raises RequirementError when Claude reports the request as out of scope,
+    Raises RequirementError when the model reports the request as out of scope,
     and _InvalidReply when the reply cannot be used as it stands.
     """
     try:
@@ -131,7 +136,8 @@ def _read_reply(raw: str) -> tuple[dict, list[str]]:
 
 
 def _parse_with_llm(text: str) -> ParseResult:
-    """Ask Claude for a requirement, retrying once with the problem fed back."""
+    """Ask the model for a requirement, retrying once with the problem fed back."""
+    provider, model = active_model()
     raw = call_llm(SYSTEM_PROMPT, text)
     try:
         requirement, notes = _read_reply(raw)
@@ -142,7 +148,7 @@ def _parse_with_llm(text: str) -> ParseResult:
         )
         raw = call_llm(SYSTEM_PROMPT, retry)
         requirement, notes = _read_reply(raw)
-    return ParseResult(requirement, "llm", notes, raw)
+    return ParseResult(requirement, "llm", notes, raw, provider, model)
 
 
 def _clean_text(text) -> str:
@@ -157,9 +163,9 @@ def _clean_text(text) -> str:
 def parse_requirement(text: str) -> ParseResult:
     """Return a validated requirement for a free-text request.
 
-    Claude is asked first. If its reply is not valid JSON or fails validation,
-    it gets one retry with the problem explained. If that also fails, or Claude
-    cannot be reached, the offline keyword parser is used and the notes say why.
+    The model is asked first. If its reply is not valid JSON or fails
+    validation, it gets one retry with the problem explained. If that also
+    fails, or the model cannot be reached, the offline keyword parser is used and the notes say why.
     Raises RequirementError when the request is out of scope, such as a
     goalkeeper or a question unrelated to scouting.
     """
@@ -169,7 +175,7 @@ def parse_requirement(text: str) -> ParseResult:
     except LLMError as error:
         reason = str(error)
     except _InvalidReply as error:
-        reason = f"Claude's reply could not be used after one retry ({error})"
+        reason = f"The model's reply could not be used after one retry ({error})"
     result = offline_parse(text)
     return replace(result, notes=[f"Used the offline keyword parser. Reason: {reason}", *result.notes])
 
@@ -359,13 +365,13 @@ def _phrase_matches(text: str, phrases) -> list[tuple[int, str]]:
 
 
 def offline_parse(text: str) -> ParseResult:
-    """Return a requirement from deterministic keyword rules, without calling Claude.
+    """Return a requirement from deterministic keyword rules, without calling a model.
 
     The first position mentioned sets the group. Each recognised quality maps
     to one or more metrics with equal weight, up to six in order of mention; if
     none are recognised, a general profile for the group is used. A number
     followed by "minutes" sets min_minutes, moved to the nearest allowed limit
-    if it falls outside 600-1200, as the Claude prompt instructs. The result
+    if it falls outside 600-1200, as the system prompt instructs. The result
     passes validate_requirement.
     """
     text = _clean_text(text)
