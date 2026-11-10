@@ -32,6 +32,43 @@ MAX_WEIGHTED_METRICS = 6
 DEFAULT_MIN_MINUTES = 600
 MAX_MIN_MINUTES = 1200
 
+# Display wording shared by the app and the scouting report.
+EXCELLENT_FIT, STRONG_FIT, MODERATE_FIT = 85.0, 70.0, 55.0
+FIT_LABELS = (
+    (EXCELLENT_FIT, "Excellent fit"),
+    (STRONG_FIT, "Strong fit"),
+    (MODERATE_FIT, "Moderate fit"),
+)
+LIMITED_FIT_LABEL = "Limited fit"
+FIT_SCORE_DECIMALS = 1
+GROUP_LABELS = {
+    "Attacking Midfield/Winger": "attacking midfielders and wingers",
+    "Center Back": "center backs",
+    "Defensive/Central Midfield": "defensive and central midfielders",
+    "Full Back/Wing Back": "full backs and wing backs",
+    "Striker": "strikers",
+}
+METRIC_NAMES = {
+    "np_shots": "non-penalty shots",
+    "npxg": "non-penalty expected goals (npxG)",
+    "xa": "expected assists (xA)",
+    "key_passes": "key passes",
+    "passes_completed": "completed passes",
+    "pass_completion_pct": "pass completion",
+    "progressive_passes": "progressive passes",
+    "passes_into_final_third": "passes into the final third",
+    "progressive_carries": "progressive carries",
+    "successful_dribbles": "successful dribbles",
+    "pressures": "pressures",
+    "tackles_interceptions": "tackles won and interceptions",
+    "ball_recoveries": "ball recoveries",
+    "aerial_duels_won": "aerial duels won",
+}
+assert set(METRIC_NAMES) == set(ALLOWED_METRICS), "METRIC_NAMES must name every allowed metric"
+assert set(GROUP_LABELS) == set(OUTFIELD_GROUPS), "GROUP_LABELS must name every group"
+# PERCENT_RANK x (n - 1) is a whole number in exact arithmetic; this absorbs float error.
+RANK_TOLERANCE = 1e-6
+
 
 class RequirementError(ValueError):
     """Raised when a requirement is invalid. The message is written for the user."""
@@ -41,7 +78,7 @@ class RequirementError(ValueError):
 class FitResult:
     """A fit-score shortlist and what was scored.
 
-    table has rank, player, team, minutes, fit_score and, for each weighted
+    table has rank, player_id, player, team, minutes, fit_score and, for each weighted
     metric, its percentile and per-90 value. weights are the normalized weights
     that were scored. pool_size is the group's reference pool (players with at
     least 600 minutes, the pool percentiles come from); eligible_players is how
@@ -153,6 +190,55 @@ def validate_requirement(req: dict) -> dict:
     return {"position_group": req["position_group"], "weights": weights, "min_minutes": min_minutes}
 
 
+def fit_label(score: float) -> str:
+    """Return the wording for a fit score: Excellent, Strong, Moderate or Limited fit.
+
+    The score is rounded to one decimal first, so the label always agrees with
+    the score as displayed (84.96 shows as 85.0 and is an Excellent fit).
+    """
+    shown = round(float(score), FIT_SCORE_DECIMALS)
+    for cutoff, label in FIT_LABELS:
+        if shown >= cutoff:
+            return label
+    return LIMITED_FIT_LABEL
+
+
+def players_ranked_below(percentile: float, pool_size: int) -> int:
+    """Return how many players in the pool rank strictly below this percentile.
+
+    PERCENT_RANK = (rank - 1) / (n - 1), and rank - 1 is the number of players
+    with a strictly lower value, so percentile x (n - 1) is that count.
+    """
+    if isinstance(pool_size, bool) or not isinstance(pool_size, int) or pool_size < 1:
+        raise ValueError("pool_size must be a positive whole number")
+    if not 0.0 <= percentile <= 1.0:
+        raise ValueError("percentile must be between 0 and 1")
+    below = percentile * (pool_size - 1)
+    count = round(below)
+    if abs(below - count) > RANK_TOLERANCE:
+        raise ValueError(f"percentile {percentile} is not a PERCENT_RANK value for a pool of {pool_size}")
+    return count
+
+
+def rank_phrase(percentile: float, pool_size: int, group_label: str) -> str:
+    """Return plain wording for a percentile, such as "better than 15 of 22 other strikers".
+
+    The count comes exactly from PERCENT_RANK (see players_ranked_below). Players
+    tied with her are not counted as below her, so "best of 23" means no one
+    is level or above. "lowest of 23" means no one ranks below her, which
+    includes being tied for lowest.
+    """
+    below = players_ranked_below(percentile, pool_size)
+    others = pool_size - 1
+    if pool_size == 1:
+        return f"the only one of the {group_label} in the pool"
+    if below == others:
+        return f"best of {pool_size} {group_label}"
+    if below == 0:
+        return f"lowest of {pool_size} {group_label}"
+    return f"better than {below} of {others} other {group_label}"
+
+
 def _check_database_matches(conn: sqlite3.Connection) -> None:
     """Raise if the database's metrics or groups no longer match this module.
 
@@ -201,6 +287,7 @@ def fit_scores(conn: sqlite3.Connection, req: dict, top_n: int = 10) -> FitResul
     query = f"""
         WITH scored AS (
             SELECT
+                s.player_id,
                 s.player_name AS player,
                 s.teams AS team,
                 s.minutes,
