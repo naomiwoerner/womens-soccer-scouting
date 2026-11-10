@@ -18,6 +18,7 @@ Run from the project root with: python scripts/run_report_check.py
 """
 
 import json
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -171,6 +172,16 @@ def check_fact_sheets(conn: sqlite3.Connection) -> list[dict]:
                 share = f"{weights[entry['metric']] / total * 100:.0f}%"
                 if entry["weight"] != share:
                     fail(f"{where} {entry['metric']}: weight {entry['weight']} != {share}")
+                column = fit.SEASON_COLUMNS[entry["metric"]]
+                below, _ = raw_counts(group_rows[column].to_numpy(), s[column])
+                match = (
+                    "clear match" if 4 * below >= 3 * (n - 1)
+                    else "partial match" if 2 * below >= n - 1
+                    else "no match"
+                )
+                if entry["match"] != match:
+                    fail(f"{where} {entry['metric']}: match {entry['match']!r} != {match!r}")
+                entry_counts[match] = entry_counts.get(match, 0) + 1
             pct = {m: p[f"{fit.SEASON_COLUMNS[m]}_pctl"] for m in fit.ALLOWED_METRICS}
             top = sorted(pct.values(), reverse=True)[:3]
             bottom = sorted(pct.values())[:3]
@@ -203,13 +214,34 @@ def check_fact_sheets(conn: sqlite3.Connection) -> list[dict]:
                 fail(f"{where}: {len(sheet['caveats'])} caveats")
     print(f"  {sheets} fact sheets checked; caveats raised: {caveat_counts}")
     print(f"  {entry_counts['tied']} fact-sheet entries say 'tied for lowest', each confirmed from raw values")
+    matches = {k: v for k, v in entry_counts.items() if k != 'tied'}
+    print(f"  weighted-metric match labels confirmed from raw counts: {matches}")
     if not entry_counts["tied"]:
         fail("no fact sheet exercised the 'tied for lowest' wording")
     return all_sheets
 
 
+ORDINAL = re.compile(r"\b\d+(?:st|nd|rd|th)\b")
+RANK_COUNT = re.compile(r"^better than (\d+) of (\d+) other ")
+
+
+def share_from_phrase(phrase: str) -> float:
+    """Return the share of other players she ranks above, read back from a rank phrase."""
+    if phrase.startswith("best of "):
+        return 1.0
+    if phrase.startswith(("lowest of ", "tied for lowest of ")):
+        return 0.0
+    below, others = RANK_COUNT.match(phrase).groups()
+    return int(below) / int(others)
+
+
+def join_names(names: list[str]) -> str:
+    return names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+
+
 def check_offline_reports(sheets: list[dict]) -> None:
     print("4. Offline reports for every fact sheet")
+    verdict_counts = {"clear": 0, "partly": 0, "not": 0}
     for sheet in sheets:
         name = sheet["player"]["name"]
         sections = offline_report(sheet).sections
@@ -234,7 +266,29 @@ def check_offline_reports(sheets: list[dict]) -> None:
         for entry in sheet["weighted_metrics"]:
             if entry["weight"] not in text or entry["value"] not in text:
                 fail(f"{name}: offline report lacks {entry['metric']} weight or value")
+        if ORDINAL.search(text):
+            fail(f"{name}: offline report uses an ordinal")
+        fit_text = json.dumps(sections["fit_for_profile"], ensure_ascii=False)
+        verdicts = {"clear": [], "partly": [], "not": []}
+        for entry in sheet["weighted_metrics"]:
+            share = share_from_phrase(entry["rank"])
+            key = "clear" if share >= 0.75 else "not" if share < 0.5 else "partly"
+            verdicts[key].append(entry["name"])
+            verdict_counts[key] += 1
+        clauses = {
+            "clear": "clearly meets the request on {}, where she is better than at least three quarters",
+            "partly": "only partly on {}",
+            "not": "on {}, where she is in the lower half" if (verdicts["clear"] or verdicts["partly"])
+            else "in the lower half of the other {group} on {}",
+        }
+        group = fit.GROUP_LABELS[sheet["player"]["position_group"]]
+        for key, names in verdicts.items():
+            if names and clauses[key].format(join_names(names), group=group) not in fit_text:
+                fail(f"{name}: fit_for_profile does not say {key} for {names}")
+        if not verdicts["clear"] and "does not" not in fit_text:
+            fail(f"{name}: fit_for_profile should say no quality is clearly met")
     print(f"  {len(sheets)} offline reports: six well-formed sections, every caveat quoted, no percentiles")
+    print(f"  closing fit sentence matches rank phrases; verdicts per weighted metric: {verdict_counts}")
 
 
 VALID_REPORT = {
@@ -337,8 +391,8 @@ def check_generator(conn: sqlite3.Connection) -> None:
     expect("blank request text: description from weights", [valid], "llm", 1, uses_description, request_text="  ")
     prompt_ok = all(f'"{name}"' in report.SYSTEM_PROMPT for name in report.SECTIONS) and (
         'Do not quote the "percentile" fields' in report.SYSTEM_PROMPT
-    )
-    print(f"  [{'ok' if prompt_ok else 'FAIL'}] system prompt names all six sections and bans quoting percentiles")
+    ) and "Never use ordinals" in report.SYSTEM_PROMPT and "\"match\" field" in report.SYSTEM_PROMPT
+    print(f"  [{'ok' if prompt_ok else 'FAIL'}] system prompt names all six sections, uses the match field, bans percentiles and ordinals")
     if not prompt_ok:
         fail("system prompt")
 
