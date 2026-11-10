@@ -256,9 +256,19 @@ def check_offline_reports(sheets: list[dict]) -> None:
                 fail(f"{name}: offline section {section} is malformed")
         text = json.dumps(sections, ensure_ascii=False)
         caveat_text = json.dumps(sections["caveats"], ensure_ascii=False)
-        for caveat in sheet["caveats"] or [report.NO_CAVEATS]:
+        mentioned = sheet["weighted_metrics"] + sheet["strengths"] + sheet["weaknesses"]
+        unflagged = {
+            e["name"] for e in mentioned if e["reliability"] == "low" and e["name"] not in " ".join(sheet["caveats"])
+        }
+        expected_caveats = list(sheet["caveats"]) or ([] if unflagged else [report.NO_CAVEATS])
+        for caveat in expected_caveats:
             if json.dumps(caveat, ensure_ascii=False)[1:-1] not in caveat_text:
                 fail(f"{name}: caveat missing from offline report")
+        for metric_name in unflagged:
+            if metric_name.lower() not in caveat_text.lower() or "low reliability at 600 minutes" not in caveat_text:
+                fail(f"{name}: low-reliability {metric_name} not named in the caveats")
+        if unflagged and report.NO_CAVEATS in caveat_text:
+            fail(f"{name}: says no caveats while naming low-reliability metrics")
         # Caveats may mention percentiles as a concept; the template's own wording may not.
         own_text = json.dumps({k: v for k, v in sections.items() if k != "caveats"}, ensure_ascii=False)
         if "percentile" in own_text:

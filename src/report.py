@@ -85,7 +85,8 @@ class ScoutingReport:
     sections maps each name in SECTIONS to a paragraph (str) or bullet points
     (list of str). source is "llm" or "offline". provider and model name the
     model that wrote it, or are None for the offline template. fact_sheet is
-    what the report was written from; notes explain any fallback.
+    what the report was written from; notes explain any fallback. request is
+    the scout's request as the model saw it (None for a bare offline report).
     """
 
     sections: dict
@@ -94,6 +95,7 @@ class ScoutingReport:
     model: str | None
     fact_sheet: dict
     notes: list[str]
+    request: str | None = None
 
 
 def _format_value(metric: str, value: float) -> tuple[str, str]:
@@ -376,7 +378,7 @@ def generate_report(
         request = request_text.strip()
     try:
         sections, provider, model = _report_with_llm(request, fact_sheet)
-        return ScoutingReport(sections, "llm", provider, model, fact_sheet, notes)
+        return ScoutingReport(sections, "llm", provider, model, fact_sheet, notes, request)
     except LLMError as error:
         reason = str(error)
     except _InvalidReport as error:
@@ -389,6 +391,7 @@ def generate_report(
         None,
         fact_sheet,
         [f"Used the offline report template. Reason: {reason}", *notes],
+        request,
     )
 
 
@@ -436,6 +439,20 @@ def _fit_judgement(fact_sheet: dict) -> str:
     return sentence + "."
 
 
+def _unflagged_low_reliability(fact_sheet: dict) -> list[dict]:
+    """Return low-reliability metrics the offline report mentions that no caveat names."""
+    caveat_text = " ".join(fact_sheet["caveats"])
+    seen, unflagged = set(), []
+    for key in ("weighted_metrics", "strengths", "weaknesses"):
+        for entry in fact_sheet[key]:
+            if entry["metric"] in seen:
+                continue
+            seen.add(entry["metric"])
+            if entry["reliability"] == "low" and entry["name"] not in caveat_text:
+                unflagged.append(entry)
+    return unflagged
+
+
 def offline_report(fact_sheet: dict) -> ScoutingReport:
     """Return a deterministic report with the same six sections, written from the fact sheet.
 
@@ -471,7 +488,20 @@ def offline_report(fact_sheet: dict) -> ScoutingReport:
             for entry in weighted
         )
         fit_for_profile = f"Weighted metrics: {metrics}. {judgement}"
-    caveats = fact_sheet["caveats"] or [NO_CAVEATS]
+    caveats = list(fact_sheet["caveats"]) or [NO_CAVEATS]
+    unflagged = _unflagged_low_reliability(fact_sheet)
+    if unflagged:
+        extra = (
+            f"{_sentence_start(_names(unflagged))} {'has' if len(unflagged) == 1 else 'have'} "
+            f"low reliability at {DEFAULT_MIN_MINUTES} minutes, so read {'it' if len(unflagged) == 1 else 'them'} "
+            "as a weak signal."
+        )
+        if fact_sheet["caveats"] and len(caveats) >= MAX_BULLETS:
+            caveats[-1] = f"{caveats[-1]} {extra}"
+        elif fact_sheet["caveats"]:
+            caveats.append(extra)
+        else:
+            caveats = [extra]
     sections = {
         "summary": summary,
         "strengths": [_metric_line(entry) for entry in strengths],
