@@ -1,7 +1,8 @@
 """Check src/llm.py and the parser's provider record without any network calls.
 
-Covers settings (provider, keys, secrets.toml), every Anthropic and Gemini
-failure path with simulated SDK errors and responses, the request settings
+Covers settings (provider, keys, Gemini model, secrets.toml), every Anthropic
+and Gemini failure path with simulated SDK errors and responses, the single
+retry after a Gemini 503, the request settings
 sent to each SDK, and that no message or log line ever contains a key. Run
 from the project root with: python scripts/run_llm_check.py
 """
@@ -29,7 +30,7 @@ import src.requirement_parser as parser  # noqa: E402
 FAKE_GEMINI_KEY = "AIza-FAKE-GEMINI-KEY-DO-NOT-LEAK"
 FAKE_ANTHROPIC_KEY = "sk-ant-FAKE-ANTHROPIC-KEY-DO-NOT-LEAK"
 FAKE_KEYS = (FAKE_GEMINI_KEY, FAKE_ANTHROPIC_KEY)
-SETTING_NAMES = (llm.PROVIDER_SETTING, *llm.KEY_NAMES.values())
+SETTING_NAMES = (llm.PROVIDER_SETTING, llm.GEMINI_MODEL_SETTING, *llm.KEY_NAMES.values())
 
 failures: list[str] = []
 log_stream = io.StringIO()
@@ -217,11 +218,99 @@ def gemini_client(*, raises=None, reply=None):
     return client
 
 
-def run_gemini(client):
-    env = {"LLM_PROVIDER": "gemini", "GEMINI_API_KEY": FAKE_GEMINI_KEY}
-    with mock.patch.object(llm.genai, "Client", return_value=client) as constructor:
+def run_gemini(client, extra_env=None, sleeps=None):
+    """Call the Gemini path with a fake client; record any retry wait in sleeps."""
+    env = {"LLM_PROVIDER": "gemini", "GEMINI_API_KEY": FAKE_GEMINI_KEY, **(extra_env or {})}
+    sleeps = [] if sleeps is None else sleeps
+    with (
+        mock.patch.object(llm.genai, "Client", return_value=client) as constructor,
+        mock.patch.object(llm.time, "sleep", side_effect=sleeps.append),
+    ):
         result = with_settings(env, None, lambda: llm.call_llm("system", "user"))
     return result, constructor
+
+
+def check_gemini_retry() -> None:
+    print("Gemini 503 retry")
+    unavailable = api_error(genai_errors.ServerError, 503, "UNAVAILABLE", "The model is overloaded.")
+    ok = gemini_reply(parts=[gt.Part(text='{"a": 1}')])
+
+    client, sleeps = gemini_client(raises=[unavailable, ok]), []
+    result, _ = run_gemini(client, sleeps=sleeps)
+    check(
+        "503 then success: reply returned after one 2 s wait",
+        result == '{"a": 1}' and client.models.generate_content.call_count == 2 and sleeps == [2.0],
+        f"calls {client.models.generate_content.call_count}, waits {sleeps}",
+    )
+
+    client, sleeps = gemini_client(raises=[unavailable, unavailable]), []
+    expect_error(
+        "503 twice: LLMError after the second attempt",
+        lambda: run_gemini(client, sleeps=sleeps),
+        "temporarily unavailable (status 503)",
+    )
+    check(
+        "503 twice: exactly two attempts and one wait",
+        client.models.generate_content.call_count == 2 and sleeps == [2.0],
+        f"calls {client.models.generate_content.call_count}, waits {sleeps}",
+    )
+
+    request = httpx2.Request("POST", "https://generativelanguage.googleapis.com/")
+    others = [
+        ("429", api_error(genai_errors.ClientError, 429, "RESOURCE_EXHAUSTED", "Quota.")),
+        ("500", api_error(genai_errors.ServerError, 500, "INTERNAL", "Oops.")),
+        ("504", api_error(genai_errors.ServerError, 504, "DEADLINE_EXCEEDED", "Slow.")),
+        ("bad key", api_error(genai_errors.ClientError, 400, "INVALID_ARGUMENT", "Bad.", "API_KEY_INVALID")),
+        ("timeout", httpx2.ReadTimeout("timed out", request=request)),
+        ("connection", httpx2.ConnectError("refused", request=request)),
+    ]
+    for label, error in others:
+        client, sleeps = gemini_client(raises=[error, ok]), []
+        try:
+            run_gemini(client, sleeps=sleeps)
+            raised = False
+        except llm.LLMError:
+            raised = True
+        check(
+            f"{label}: no retry",
+            raised and client.models.generate_content.call_count == 1 and sleeps == [],
+            f"calls {client.models.generate_content.call_count}",
+        )
+
+
+def check_gemini_model_setting() -> None:
+    print("Gemini model setting")
+    check("default model when unset", with_settings({}, None, llm.active_model) == ("gemini", llm.GEMINI_MODEL))
+    check(
+        "GEMINI_MODEL from secrets.toml",
+        with_settings({}, 'GEMINI_MODEL = "gemini-from-file"\n', llm.active_model) == ("gemini", "gemini-from-file"),
+    )
+    check(
+        "GEMINI_MODEL from environment wins",
+        with_settings({"GEMINI_MODEL": "gemini-from-env"}, 'GEMINI_MODEL = "gemini-from-file"\n', llm.active_model)
+        == ("gemini", "gemini-from-env"),
+    )
+    check(
+        "GEMINI_MODEL does not affect Anthropic",
+        with_settings({"LLM_PROVIDER": "anthropic", "GEMINI_MODEL": "x"}, None, llm.active_model)
+        == ("anthropic", llm.ANTHROPIC_MODEL),
+    )
+    ok = gemini_reply(parts=[gt.Part(text="ok")])
+    client = gemini_client(reply=ok)
+    run_gemini(client, extra_env={"GEMINI_MODEL": "gemini-custom"})
+    sent = client.models.generate_content.call_args.kwargs["model"]
+    check("request uses the configured model", sent == "gemini-custom", sent)
+    expect_error(
+        "404 names the configured model",
+        lambda: run_gemini(
+            gemini_client(raises=api_error(genai_errors.ClientError, 404, "NOT_FOUND", "No.")),
+            extra_env={"GEMINI_MODEL": "gemini-custom"},
+        ),
+        "The model gemini-custom was not found",
+    )
+    with mock.patch.object(parser, "call_llm", return_value='{"position_group": "Striker", "weights": {"npxg": 3}}'):
+        result = with_settings({"GEMINI_MODEL": "gemini-custom"}, None, lambda: parser.parse_requirement("a striker"))
+    check("parser records the configured model", result.model == "gemini-custom", str(result.model))
 
 
 def api_error(cls, code, status, message, reason=None):
@@ -345,6 +434,8 @@ def main() -> None:
     check_settings()
     check_anthropic()
     check_gemini()
+    check_gemini_retry()
+    check_gemini_model_setting()
     check_parser_record()
     root.removeHandler(handler)
     logs = log_stream.getvalue()
